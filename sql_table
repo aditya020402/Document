@@ -7,3 +7,9 @@ CREATE TABLE IF NOT EXISTS automation_embeddings (
     embedding vector(1536),  -- Ada embeddings are 1536 dimensions
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+
+CREATE INDEX IF NOT EXISTS automation_embedding_idx 
+ON automation_embeddings 
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
