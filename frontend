@@ -1,0 +1,646 @@
+import streamlit as st
+import asyncio
+import json
+from pathlib import Path
+import tempfile
+from typing import Dict, Any
+import pandas as pd
+
+# Use the correct PDF viewer import
+from streamlit_pdf_viewer import pdf_viewer
+
+# Import your LangGraph workflow
+from document_automation_workflow import DocumentAutomationWorkflow
+
+st.set_page_config(
+    page_title="Document Automation Analyzer",
+    page_icon="📄",
+    layout="wide"
+)
+
+st.title("📄 Document Automation Analyzer")
+st.markdown("Upload a PDF document or paste text to get AI-powered automation recommendations and generated scripts")
+
+# Initialize session state
+if 'workflow_results' not in st.session_state:
+    st.session_state.workflow_results = None
+if 'processing_complete' not in st.session_state:
+    st.session_state.processing_complete = False
+
+# NEW: Input method selection
+st.markdown("### 📥 Choose Input Method")
+input_method = st.radio(
+    "Select how you want to provide your document:",
+    options=["Upload PDF File", "Paste/Type Text"],
+    horizontal=True,
+    help="Choose whether to upload a PDF or directly paste/type your document content"
+)
+
+uploaded_file = None
+text_input = None
+tmp_file_path = None
+
+# PDF Upload Section
+if input_method == "Upload PDF File":
+    st.markdown("#### 📎 Upload PDF Document")
+    uploaded_file = st.file_uploader(
+        "Choose a PDF file",
+        type="pdf",
+        help="Upload a PDF document to analyze for automation opportunities"
+    )
+    
+    if uploaded_file is not None:
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_file_path = tmp_file.name
+        
+        st.success(f"✅ File uploaded: {uploaded_file.name}")
+        
+        # Display PDF using streamlit-pdf-viewer
+        st.markdown("**Document Preview:**")
+        pdf_viewer(
+            uploaded_file.getvalue(),
+            width=700,
+            height=400,
+            annotations=[],
+            render_text=True
+        )
+
+# Text Input Section
+else:
+    st.markdown("#### ✍️ Paste or Type Your Document")
+    text_input = st.text_area(
+        "Paste your document content here:",
+        height=400,
+        placeholder="""Paste your runbook, process document, or technical documentation here...
+
+Example:
+# Deployment Process
+1. Check system prerequisites
+2. Install dependencies
+3. Configure environment variables
+...
+        """,
+        help="Paste or type your document content for automation analysis"
+    )
+    
+    if text_input and len(text_input.strip()) > 50:
+        # Show word and character count
+        word_count = len(text_input.split())
+        char_count = len(text_input)
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Characters", f"{char_count:,}")
+        with col2:
+            st.metric("Words", f"{word_count:,}")
+        with col3:
+            st.metric("Lines", len(text_input.split('\n')))
+        
+        # Create a temporary text file for processing
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".txt", encoding='utf-8') as tmp_file:
+            tmp_file.write(text_input)
+            tmp_file_path = tmp_file.name
+        
+        st.success(f"✅ Text content ready for analysis ({word_count} words)")
+        
+        # Show preview
+        with st.expander("📖 Preview Pasted Content", expanded=False):
+            st.text_area(
+                "Content Preview",
+                value=text_input[:1000] + ("..." if len(text_input) > 1000 else ""),
+                height=200,
+                disabled=True,
+                label_visibility="collapsed"
+            )
+    elif text_input:
+        st.warning("⚠️ Please paste at least 50 characters of text for meaningful analysis")
+
+# Process button - shown only when input is provided
+if (input_method == "Upload PDF File" and uploaded_file is not None) or \
+   (input_method == "Paste/Type Text" and text_input and len(text_input.strip()) > 50):
+    
+    if st.button("🚀 Analyze Document for Automation", type="primary", use_container_width=True):
+        with st.spinner("Processing document through AI agents..."):
+            try:
+                # Initialize workflow
+                workflow = DocumentAutomationWorkflow()
+                
+                # Process based on input method
+                if input_method == "Upload PDF File":
+                    # Process PDF
+                    results = asyncio.run(workflow.process_document(tmp_file_path))
+                else:
+                    # Process text input - use modified method
+                    results = asyncio.run(workflow.process_text_document(tmp_file_path))
+                
+                st.session_state.workflow_results = results
+                st.session_state.processing_complete = True
+                st.success("✅ Analysis complete! View results in the tabs below.")
+                
+            except Exception as e:
+                st.error(f"❌ Error processing document: {str(e)}")
+                st.exception(e)
+
+# Display results if available - 5 TABS
+if st.session_state.workflow_results:
+    results = st.session_state.workflow_results
+    
+    # Create 5 tabs
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📄 Raw Content", 
+        "🧹 Cleaned Content", 
+        "🎯 Automation Analysis",
+        "📈 Improved Document",
+        "🤖 Script Generation"
+    ])
+    
+    with tab1:
+        st.subheader("Raw Extracted Content")
+        
+        # Show processing summary for raw content
+        if 'processing_summary' in results['parsed_content']:
+            summary = results['parsed_content']['processing_summary']
+            
+            # Different metrics based on input type
+            if input_method == "Upload PDF File":
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total Pages", results['parsed_content'].get('total_pages', 0))
+                with col2:
+                    st.metric("Pages with Images", summary.get('pages_with_images', 0))
+                with col3:
+                    st.metric("Total Images", summary.get('total_images', 0))
+                with col4:
+                    st.metric("Raw Text Length", f"{summary.get('total_text_length', 0):,} chars")
+            else:
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Input Type", "Text Input")
+                with col2:
+                    st.metric("Content Length", f"{summary.get('total_text_length', 0):,} chars")
+                with col3:
+                    st.metric("Processing Method", "Direct Text")
+        
+        # Display raw combined content
+        st.markdown("**Complete Raw Extracted Content:**")
+        st.text_area(
+            label="Raw Content Display",
+            value=results['parsed_content']['combined_text'], 
+            height=400, 
+            disabled=True,
+            help="This shows all raw content from your document",
+            label_visibility="hidden"
+        )
+        
+        # Show page breakdown for PDF only
+        if input_method == "Upload PDF File" and 'page_breakdown' in results['parsed_content']:
+            st.markdown("**Page Processing Details:**")
+            df_pages = pd.DataFrame(results['parsed_content']['page_breakdown'])
+            st.dataframe(df_pages, use_container_width=True)
+    
+    with tab2:
+        st.subheader("Cleaned & Processed Content")
+        
+        # Show cleaning statistics
+        if 'cleaning_stats' in results['cleaned_content']:
+            stats = results['cleaned_content']['cleaning_stats']
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Original Length", f"{stats['original_length']:,} chars")
+            with col2:
+                st.metric("Cleaned Length", f"{stats['cleaned_length']:,} chars")
+            with col3:
+                st.metric("Noise Removed", f"{stats['reduction_percentage']}%")
+            with col4:
+                st.metric("Sections Found", stats['sections_identified'])
+        
+        # Show multimodal image analysis only for PDF uploads
+        if input_method == "Upload PDF File" and 'image_analysis' in results['cleaned_content'] and results['cleaned_content']['image_analysis']:
+            image_analyses = results['cleaned_content']['image_analysis']
+            st.markdown("### 🖼️ Multimodal Image Analysis Results")
+            st.info(f"Processed {len(image_analyses)} images using GPT-4o mini multimodal capabilities")
+            
+            with st.expander(f"📸 View All {len(image_analyses)} Image Analysis Results", expanded=False):
+                for i, img_analysis in enumerate(image_analyses, 1):
+                    st.markdown(f"**Image {i} (Page {img_analysis.get('page', 'Unknown')}):**")
+                    
+                    col1, col2 = st.columns([1, 1])
+                    with col1:
+                        st.markdown("**🔤 Extracted Text:**")
+                        extracted_text = img_analysis.get('extracted_text', 'No text found')
+                        if extracted_text.strip():
+                            st.code(extracted_text)
+                        else:
+                            st.info("No text detected in image")
+                        
+                        st.markdown("**📋 Image Description:**")
+                        st.write(img_analysis.get('image_description', 'No description available'))
+                    
+                    with col2:
+                        st.markdown("**🎯 Purpose in Document:**")
+                        st.write(img_analysis.get('purpose', 'Purpose not determined'))
+                        
+                        st.markdown("**🤖 Automation Relevance:**")
+                        automation_relevance = img_analysis.get('automation_relevance', 'Not assessed')
+                        if 'automation' in automation_relevance.lower():
+                            st.success(f"✅ {automation_relevance}")
+                        else:
+                            st.info(f"📝 {automation_relevance}")
+                    
+                    if i < len(image_analyses):
+                        st.markdown("---")
+        
+        # Show what was removed
+        if 'removed_elements' in results['cleaned_content']:
+            removed = results['cleaned_content']['removed_elements']
+            st.markdown("**🧹 Content Cleaning Applied:**")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.success("✅ Headers & Footers Removed" if removed.get('headers_footers') else "❌ Headers & Footers")
+                st.success("✅ Page Numbers Removed" if removed.get('page_numbers') else "❌ Page Numbers")
+            with col2:
+                st.success("✅ OCR Noise Removed" if removed.get('ocr_noise') else "❌ OCR Noise")
+                st.success("✅ Repetitive Content Removed" if removed.get('repetitive_content') else "❌ Repetitive Content")
+        
+        # Show cleaned text
+        st.markdown("**📝 Cleaned Content (Ready for Analysis):**")
+        cleaned_content = results['cleaned_content'].get('cleaned_text', 'No cleaned content available')
+        
+        st.text_area(
+            label="Cleaned Content Display",
+            value=cleaned_content, 
+            height=350, 
+            disabled=True,
+            help="This is the cleaned content with headers, footers, OCR noise, and irrelevant text removed",
+            label_visibility="hidden"
+        )
+        
+        # Show complete key sections without truncation
+        if 'structured_content' in results['cleaned_content']:
+            structured = results['cleaned_content']['structured_content']
+            
+            st.markdown("**🔍 Complete Key Sections Identified for Automation:**")
+            
+            # Process Descriptions
+            if structured.get('sections', {}).get('process_descriptions'):
+                st.markdown("**🔄 Process Descriptions (Complete):**")
+                process_descriptions = structured['sections']['process_descriptions']
+                st.info(f"Found {len(process_descriptions)} process descriptions")
+                
+                with st.expander(f"📖 View All {len(process_descriptions)} Process Descriptions", expanded=True):
+                    for i, desc in enumerate(process_descriptions, 1):
+                        st.markdown(f"**{i}.** {desc}")
+                        if i < len(process_descriptions):
+                            st.markdown("---")
+            
+            # Task Instructions
+            if structured.get('sections', {}).get('task_instructions'):
+                st.markdown("**📋 Task Instructions (Complete):**")
+                task_instructions = structured['sections']['task_instructions']
+                st.info(f"Found {len(task_instructions)} task instructions")
+                
+                with st.expander(f"📋 View All {len(task_instructions)} Task Instructions", expanded=True):
+                    for i, task in enumerate(task_instructions, 1):
+                        st.markdown(f"**{i}.** {task}")
+                        if i < len(task_instructions):
+                            st.markdown("---")
+            
+            # Data Definitions
+            if structured.get('sections', {}).get('data_definitions'):
+                st.markdown("**📊 Data Definitions (Complete):**")
+                data_definitions = structured['sections']['data_definitions']
+                st.info(f"Found {len(data_definitions)} data definitions")
+                
+                with st.expander(f"📊 View All {len(data_definitions)} Data Definitions", expanded=True):
+                    for i, data in enumerate(data_definitions, 1):
+                        st.markdown(f"**{i}.** {data}")
+                        if i < len(data_definitions):
+                            st.markdown("---")
+            
+            # Decision Rules
+            if structured.get('sections', {}).get('decision_rules'):
+                st.markdown("**🤔 Decision Rules (Complete):**")
+                decision_rules = structured['sections']['decision_rules']
+                st.info(f"Found {len(decision_rules)} decision rules")
+                
+                with st.expander(f"🤔 View All {len(decision_rules)} Decision Rules", expanded=True):
+                    for i, rule in enumerate(decision_rules, 1):
+                        st.markdown(f"**{i}.** {rule}")
+                        if i < len(decision_rules):
+                            st.markdown("---")
+            
+            # AI-Generated Key Automation Phrases
+            if structured.get('key_phrases'):
+                st.markdown("**🔑 AI-Extracted Key Automation Phrases:**")
+                phrases = ", ".join([f"`{phrase}`" for phrase in structured['key_phrases']])
+                st.success(phrases)
+                st.caption(f"AI identified {len(structured['key_phrases'])} key automation-relevant terms from the document")
+    
+    with tab3:
+        st.subheader("🎯 Comprehensive Runbook Analysis")
+        
+        analysis = results['automation_analysis']
+        
+        # 5-Metric Dashboard
+        st.markdown("### 📊 Automation Readiness Scores")
+        
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            clarity_score = analysis.get('clarity_score', 5)
+            st.metric("🎯 Clarity", f"{clarity_score}/10", 
+                     help="Are steps precise and unambiguous?")
+        
+        with col2:
+            determinism_score = analysis.get('determinism_score', 5) 
+            st.metric("⚙️ Determinism", f"{determinism_score}/10",
+                     help="Will same input always produce same output?")
+        
+        with col3:
+            logic_score = analysis.get('logic_decision_score', 5)
+            st.metric("🧠 Logic Structure", f"{logic_score}/10",
+                     help="Are decision flows clear and automatable?")
+        
+        with col4:
+            feasibility_score = analysis.get('automation_feasibility_score', 5)
+            st.metric("🤖 Automation Feasibility", f"{feasibility_score}/10",
+                     help="Can this be mapped to scripts/APIs?")
+        
+        with col5:
+            observability_score = analysis.get('observability_score', 5)
+            st.metric("👁️ Observability", f"{observability_score}/10",
+                     help="Can execution be monitored and debugged?")
+        
+        # Overall Score
+        overall_score = analysis.get('overall_automation_score', 5.0)
+        st.metric("🏆 **Overall Automation Score**", f"{overall_score}/10", f"{overall_score*10}%")
+        
+        # Detailed Analysis Sections
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("#### 🔍 Detailed Scoring Analysis")
+            
+            st.markdown("**🎯 Clarity Analysis:**")
+            st.write(analysis.get('clarity_reasoning', 'Analysis pending...'))
+            
+            st.markdown("**⚙️ Determinism Analysis:**")
+            st.write(analysis.get('determinism_reasoning', 'Analysis pending...'))
+            
+            st.markdown("**🤖 Automation Feasibility:**")
+            st.write(analysis.get('automation_feasibility_reasoning', 'Analysis pending...'))
+        
+        with col2:
+            st.markdown("#### 🚀 Improvement Recommendations")
+            
+            if 'improvement_recommendations' in analysis:
+                for i, rec in enumerate(analysis['improvement_recommendations'], 1):
+                    st.markdown(f"**{i}.** {rec}")
+            
+            if 'critical_issues' in analysis and analysis['critical_issues']:
+                st.markdown("#### 🚨 Critical Issues")
+                for issue in analysis['critical_issues']:
+                    st.error(f"❌ {issue}")
+            
+            if 'quick_wins' in analysis and analysis['quick_wins']:
+                st.markdown("#### ⚡ Quick Wins")
+                for win in analysis['quick_wins']:
+                    st.success(f"✅ {win}")
+    
+    with tab4:
+        st.subheader("📈 AI-Improved Document")
+        
+        if 'improved_document' in results:
+            improved = results['improved_document']
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("📊 Score Increase", f"+{improved.get('automation_score_increase', 0)}")
+            with col2:
+                st.metric("🎯 New Clarity Score", f"{improved.get('new_clarity_score', 8)}/10")
+            with col3:
+                st.metric("🤖 New Feasibility", f"{improved.get('new_automation_feasibility', 8)}/10")
+            
+            if 'improvements_made' in improved:
+                st.markdown("### ✅ Improvements Applied")
+                for improvement in improved['improvements_made']:
+                    st.success(f"✓ {improvement}")
+            
+            st.markdown("### 📋 Improved Document Content")
+            st.text_area(
+                label="Improved Document",
+                value=improved.get('improved_content', 'Document improvement in progress...'),
+                height=600,
+                disabled=True,
+                help="AI-improved version of your actual document with better automation potential",
+                label_visibility="hidden"
+            )
+            
+            if improved.get('improved_content'):
+                st.download_button(
+                    label="💾 Download Improved Document",
+                    data=improved['improved_content'],
+                    file_name="improved_document.md",
+                    mime="text/markdown"
+                )
+    
+    with tab5:
+        st.subheader("🤖 Automation Script Generation")
+        
+        # Show automation commands analysis if available
+        if 'automation_commands' in results:
+            automation_cmd = results['automation_commands']
+            
+            if 'automation_summary' in automation_cmd:
+                summary = automation_cmd['automation_summary']
+                
+                st.markdown("### 📊 Automation Analysis Summary")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total Steps", summary.get('total_steps', 0))
+                with col2:
+                    st.metric("Automatable Steps", summary.get('automatable_steps', 0))
+                with col3:
+                    st.metric("UI-Only Steps", summary.get('ui_only_steps', 0))
+                with col4:
+                    automation_pct = summary.get('automation_percentage', 0)
+                    st.metric("Automation %", f"{automation_pct}%")
+            
+            if 'automatable_steps' in automation_cmd and automation_cmd['automatable_steps']:
+                st.markdown("### ✅ Automatable Steps with Commands")
+                
+                with st.expander(f"View {len(automation_cmd['automatable_steps'])} Automatable Steps", expanded=True):
+                    for i, step in enumerate(automation_cmd['automatable_steps'], 1):
+                        st.markdown(f"**Step {i}: {step.get('step_description', 'Automation Step')}**")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if step.get('linux_commands'):
+                                st.markdown("**🐧 Linux Commands:**")
+                                for cmd in step['linux_commands']:
+                                    st.code(cmd, language="bash")
+                            
+                            if step.get('sql_commands'):
+                                st.markdown("**🗄️ SQL Commands:**")
+                                for cmd in step['sql_commands']:
+                                    st.code(cmd, language="sql")
+                        
+                        with col2:
+                            if step.get('windows_commands'):
+                                st.markdown("**🪟 Windows Commands:**")
+                                for cmd in step['windows_commands']:
+                                    st.code(cmd, language="powershell")
+                            
+                            if step.get('other_commands'):
+                                st.markdown("**🔧 Other Commands:**")
+                                for cmd in step['other_commands']:
+                                    st.code(cmd)
+                        
+                        if step.get('notes'):
+                            st.info(f"📝 **Notes:** {step['notes']}")
+                        
+                        st.markdown("---")
+            
+            if 'ui_only_tasks' in automation_cmd and automation_cmd['ui_only_tasks']:
+                st.markdown("### ❌ UI-Only Tasks (Cannot be Automated)")
+                
+                for i, ui_task in enumerate(automation_cmd['ui_only_tasks'], 1):
+                    st.warning(f"**{i}. {ui_task.get('step_description', 'Manual Task')}**")
+                    st.markdown(f"**Reason:** {ui_task.get('reason', 'Manual interaction required')}")
+                    if ui_task.get('alternative_suggestion'):
+                        st.markdown(f"**Alternative:** {ui_task['alternative_suggestion']}")
+                    st.markdown("")
+        
+        # Script Generation Results
+        script_data = results['generated_script']
+        
+        if not script_data.get('automation_viable', True):
+            st.markdown("### 🚫 Script Generation Not Viable")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Automation Level", f"{script_data.get('automation_percentage', 0)}%")
+            with col2:
+                st.metric("Threshold Required", "30% minimum")
+            
+            st.markdown("#### 📋 Analysis Report")
+            st.text_area(
+                label="Automation Analysis",
+                value=script_data.get('explanation', 'Analysis not available'),
+                height=400,
+                disabled=True,
+                help="Detailed analysis of why script generation is not recommended",
+                label_visibility="hidden"
+            )
+            
+            if 'recommendations' in script_data:
+                st.markdown("#### 💡 Recommendations for Improvement")
+                for i, rec in enumerate(script_data['recommendations'], 1):
+                    st.info(f"{i}. {rec}")
+            
+            st.download_button(
+                label="📄 Download Analysis Report",
+                data=script_data.get('explanation', ''),
+                file_name="automation_analysis_report.md",
+                mime="text/markdown"
+            )
+        
+        else:
+            st.markdown("### ✅ Python Automation Script Generated")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Automation Coverage", f"{script_data.get('automation_coverage', 'N/A')}")
+            with col2:
+                st.metric("Script Type", script_data.get('script_type', 'Python Script'))
+            with col3:
+                manual_remaining = len(script_data.get('manual_steps_remaining', []))
+                st.metric("Manual Steps Left", manual_remaining)
+            
+            if script_data.get('script_description'):
+                st.info(f"📝 **Script Description:** {script_data['script_description']}")
+            
+            st.markdown("#### 🐍 Generated Python Script")
+            st.text_area(
+                label="Python Automation Script",
+                value=script_data.get('code', 'No script generated'),
+                height=500,
+                disabled=True,
+                help="Complete Python script for automation",
+                label_visibility="hidden"
+            )
+            
+            if script_data.get('parameters_required'):
+                st.markdown("#### ⚙️ Required Parameters")
+                for param in script_data['parameters_required']:
+                    st.code(param)
+            
+            if script_data.get('execution_steps'):
+                st.markdown("#### 🚀 How to Run the Script")
+                for i, step in enumerate(script_data['execution_steps'], 1):
+                    st.markdown(f"**Step {i}:** {step}")
+            
+            if script_data.get('manual_steps_remaining'):
+                st.markdown("#### ⚠️ Manual Steps Still Required")
+                for i, manual_step in enumerate(script_data['manual_steps_remaining'], 1):
+                    st.warning(f"{i}. {manual_step}")
+            
+            if script_data.get('notes'):
+                st.markdown("#### 📌 Important Notes")
+                st.info(script_data['notes'])
+            
+            st.markdown("### 📦 Download Files")
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                if script_data.get('code'):
+                    st.download_button(
+                        label="🐍 Download Python Script",
+                        data=script_data['code'],
+                        file_name="automation_script.py",
+                        mime="text/x-python",
+                        help="Download the complete Python automation script"
+                    )
+            
+            with col2:
+                if script_data.get('requirements'):
+                    requirements_content = "\n".join(script_data['requirements'])
+                    st.download_button(
+                        label="📋 Download Requirements.txt", 
+                        data=requirements_content,
+                        file_name="requirements.txt",
+                        mime="text/plain",
+                        help="Python packages required for the script"
+                    )
+            
+            with col3:
+                if script_data.get('execution_steps'):
+                    instructions_content = "# Script Execution Instructions\n\n"
+                    for i, step in enumerate(script_data['execution_steps'], 1):
+                        instructions_content += f"{i}. {step}\n"
+                    
+                    if script_data.get('parameters_required'):
+                        instructions_content += "\n## Required Parameters:\n"
+                        for param in script_data['parameters_required']:
+                            instructions_content += f"- {param}\n"
+                    
+                    st.download_button(
+                        label="📖 Download Instructions",
+                        data=instructions_content,
+                        file_name="execution_instructions.md",
+                        mime="text/markdown",
+                        help="Step-by-step instructions to run the script"
+                    )
+            
+            if script_data.get('requirements'):
+                st.markdown("#### 📦 Required Python Packages")
+                deps_display = []
+                for dep in script_data['requirements']:
+                    deps_display.append(f"`{dep}`")
+                st.markdown(" • ".join(deps_display))
+
+# Cleanup
+if tmp_file_path and Path(tmp_file_path).exists():
+    Path(tmp_file_path).unlink(missing_ok=True)
