@@ -12,6 +12,9 @@ import json
 from datetime import datetime
 from pathlib import Path
 import base64
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from openai import AzureOpenAI
 
 class WorkflowState(TypedDict):
     """State schema for the document automation workflow"""
@@ -20,13 +23,14 @@ class WorkflowState(TypedDict):
     cleaned_content: Dict[str, Any]
     automation_analysis: Dict[str, Any]
     improved_document: Dict[str, Any]
+    similarity_matches: Dict[str, Any]  # NEW
     automation_commands: Dict[str, Any]
     generated_script: Dict[str, Any]
     messages: List[Any]
     current_step: str
 
 class DocumentAutomationWorkflow:
-    def __init__(self):
+    def __init__(self, db_config: Dict[str, str] = None, azure_embedding_config: Dict[str, str] = None):
         # Initialize LLM with GPT-4o mini for multimodal capabilities
         self.llm = ChatOpenAI(
             model="gpt-4o-mini",
@@ -35,6 +39,35 @@ class DocumentAutomationWorkflow:
             api_key="your-api-key",
             api_version="2024-07-18"
         )
+        
+        # NEW: Database configuration
+        self.db_config = db_config or {
+            'dbname': 'automation_db',
+            'user': 'your_username',
+            'password': 'your_password',
+            'host': 'localhost',
+            'port': '5432'
+        }
+        
+        # NEW: Azure embedding configuration
+        self.azure_embedding_config = azure_embedding_config or {
+            'api_key': 'your-azure-api-key',
+            'api_version': '2023-05-15',
+            'endpoint': 'https://your-resource.openai.azure.com/',
+            'embedding_deployment': 'text-embedding-ada-002'
+        }
+        
+        # NEW: Initialize Azure OpenAI client for embeddings
+        try:
+            self.embedding_client = AzureOpenAI(
+                api_key=self.azure_embedding_config['api_key'],
+                api_version=self.azure_embedding_config['api_version'],
+                azure_endpoint=self.azure_embedding_config['endpoint']
+            )
+            self.embedding_enabled = True
+        except Exception as e:
+            print(f"⚠️ Warning: Could not initialize embedding client: {e}")
+            self.embedding_enabled = False
         
         # Build the workflow graph
         self.workflow = self._build_workflow()
@@ -45,10 +78,11 @@ class DocumentAutomationWorkflow:
         # Create state graph
         workflow = StateGraph(WorkflowState)
         
-        # Add nodes for the 5-step process
+        # Add nodes for the 6-step process
         workflow.add_node("parse_document", self._parse_document_agent)
         workflow.add_node("clean_text", self._text_cleaning_agent)
         workflow.add_node("analyze_automation", self._enhanced_automation_analysis_agent)
+        workflow.add_node("similarity_matching", self._similarity_matching_agent)  # NEW
         workflow.add_node("automation_commands", self._automation_commands_agent)
         workflow.add_node("generate_script", self._script_generation_agent)
         
@@ -56,7 +90,8 @@ class DocumentAutomationWorkflow:
         workflow.add_edge(START, "parse_document")
         workflow.add_edge("parse_document", "clean_text")
         workflow.add_edge("clean_text", "analyze_automation")
-        workflow.add_edge("analyze_automation", "automation_commands")
+        workflow.add_edge("analyze_automation", "similarity_matching")  # NEW
+        workflow.add_edge("similarity_matching", "automation_commands")  # MODIFIED
         workflow.add_edge("automation_commands", "generate_script")
         workflow.add_edge("generate_script", END)
         
@@ -84,7 +119,7 @@ class DocumentAutomationWorkflow:
         return state
     
     async def _extract_content_by_page(self, pdf_path: str) -> Dict[str, Any]:
-        """Extract text and images page by page using multimodal GPT-4o mini - FIXED"""
+        """Extract text and images page by page using multimodal GPT-4o mini"""
         
         combined_text = ""
         page_details = []
@@ -105,7 +140,7 @@ class DocumentAutomationWorkflow:
             text_dict = page.get_text("dict", sort=True)
             page_text_content = self._extract_text_from_page_dict(text_dict)
             
-            # Step 2: FIXED - Use multimodal GPT for images and embed descriptions
+            # Step 2: Use multimodal GPT for images and embed descriptions
             image_list = page.get_images()
             page_multimodal_content = ""
             page_image_analysis = []
@@ -121,10 +156,10 @@ class DocumentAutomationWorkflow:
                         if pix.n - pix.alpha < 4:  # GRAY or RGB
                             img_data = pix.tobytes("png")
                             
-                            # FIXED: Use multimodal GPT and properly handle results
+                            # Use multimodal GPT and properly handle results
                             multimodal_result = await self._perform_multimodal_analysis(img_data, page_num + 1, img_index + 1)
                             
-                            # FIXED: Always add image analysis to content, even if no text extracted
+                            # Always add image analysis to content
                             image_content_block = f"\n[IMAGE_{img_index + 1}_ANALYSIS]:\n"
                             image_content_block += f"Description: {multimodal_result['description']}\n"
                             image_content_block += f"Purpose: {multimodal_result['purpose']}\n"
@@ -155,15 +190,14 @@ class DocumentAutomationWorkflow:
                         
                     except Exception as e:
                         print(f"Error processing image {img_index + 1} on page {page_num + 1}: {e}")
-                        # Add error information to content
                         error_block = f"\n[IMAGE_{img_index + 1}_ERROR]: Failed to process image - {str(e)}\n"
                         page_multimodal_content += error_block
             
-            # Step 3: FIXED - Combine text and multimodal content with proper integration
+            # Step 3: Combine text and multimodal content with proper integration
             page_combined = f"\n--- PAGE {page_num + 1} ---\n"
             page_combined += page_text_content
             
-            # FIXED: Always add image analysis section if there are images
+            # Always add image analysis section if there are images
             if image_list:
                 page_combined += f"\n--- IMAGES ANALYSIS FOR PAGE {page_num + 1} ---\n"
                 page_combined += page_multimodal_content
@@ -174,12 +208,12 @@ class DocumentAutomationWorkflow:
             # Add to combined text
             combined_text += page_combined
             
-            # FIXED: Store page details with correct multimodal content length
+            # Store page details with correct multimodal content length
             page_details.append({
                 'page_number': page_num + 1,
                 'text_length': len(page_text_content),
                 'image_count': len(image_list),
-                'multimodal_content_length': len(page_multimodal_content),  # FIXED: Now correctly calculated
+                'multimodal_content_length': len(page_multimodal_content),
                 'combined_length': len(page_combined)
             })
             
@@ -222,13 +256,13 @@ class DocumentAutomationWorkflow:
         return text_content
     
     async def _perform_multimodal_analysis(self, image_data: bytes, page_num: int, img_num: int) -> Dict[str, str]:
-        """FIXED: Perform multimodal analysis using GPT-4o mini with better error handling"""
+        """Perform multimodal analysis using GPT-4o mini with better error handling"""
         
         try:
             # Convert image to base64
             img_base64 = base64.b64encode(image_data).decode('utf-8')
             
-            # ENHANCED: Create more detailed multimodal prompt
+            # Create more detailed multimodal prompt
             multimodal_prompt = f"""
             Analyze this image from page {page_num}, image {img_num} of a technical/business document and provide detailed information:
 
@@ -276,7 +310,7 @@ class DocumentAutomationWorkflow:
                     "type": "image_url",
                     "image_url": {
                         "url": f"data:image/png;base64,{img_base64}",
-                        "detail": "high"  # High detail for better text extraction
+                        "detail": "high"
                     }
                 }
             ]
@@ -294,7 +328,7 @@ class DocumentAutomationWorkflow:
                     'automation_relevance': 'Could not analyze'
                 }
             
-            # FIXED: Better parsing of the response
+            # Better parsing of the response
             content = response.content.strip()
             print(f"✅ GPT-4o mini response length: {len(content)} characters")
             
@@ -403,23 +437,20 @@ class DocumentAutomationWorkflow:
         return state
     
     def _basic_text_cleaning(self, text: str) -> str:
-        """UPDATED: Perform basic regex-based text cleaning while preserving image analysis"""
+        """Perform basic regex-based text cleaning while preserving image analysis"""
         
         # Remove page markers but preserve image analysis blocks
         text = re.sub(r'--- PAGE \d+ ---', '', text)
         text = re.sub(r'--- END PAGE \d+ ---', '', text)
         
-        # CHANGED: Don't remove image analysis markers - keep them for automation analysis
-        # Preserve [IMAGE_X_ANALYSIS] blocks
-        
         # Remove common OCR noise patterns but be more careful around image blocks
         ocr_noise_patterns = [
-            r'\b[A-Z]{1}\s+[A-Z]{1}\s+[A-Z]{1}\b',  # Scattered single letters
-            r'\b\d{1}\s+\d{1}\s+\d{1}\b',  # Scattered single digits
-            r'[|¦!]{3,}',  # Multiple vertical bars/pipes (changed from 2+ to 3+)
-            r'_{4,}',  # Multiple underscores (changed from 3+ to 4+)
-            r'-{6,}',  # Multiple dashes (changed from 5+ to 6+)
-            r'\s{4,}',  # Multiple spaces (changed from 3+ to 4+)
+            r'\b[A-Z]{1}\s+[A-Z]{1}\s+[A-Z]{1}\b',
+            r'\b\d{1}\s+\d{1}\s+\d{1}\b',
+            r'[|¦!]{3,}',
+            r'_{4,}',
+            r'-{6,}',
+            r'\s{4,}',
         ]
         
         for pattern in ocr_noise_patterns:
@@ -438,8 +469,8 @@ class DocumentAutomationWorkflow:
             text = re.sub(pattern, '', text, flags=re.MULTILINE | re.IGNORECASE)
         
         # Clean up whitespace but preserve image analysis structure
-        text = re.sub(r'\n\s*\n\s*\n', '\n\n', text)  # Multiple newlines to double
-        text = re.sub(r' +', ' ', text)  # Multiple spaces to single
+        text = re.sub(r'\n\s*\n\s*\n', '\n\n', text)
+        text = re.sub(r' +', ' ', text)
         text = text.strip()
         
         return text
@@ -468,14 +499,12 @@ class DocumentAutomationWorkflow:
         if len(lines) < 10:
             return text
         
-        # Simple approach: remove very short lines that appear multiple times
         line_counts = {}
         for line in lines:
             clean_line = re.sub(r'\d+', 'NUM', line.strip())
             if 5 < len(clean_line) < 50:
                 line_counts[clean_line] = line_counts.get(clean_line, 0) + 1
         
-        # Remove lines that appear 3+ times
         repetitive_patterns = {line for line, count in line_counts.items() if count >= 3}
         
         filtered_lines = []
@@ -489,7 +518,6 @@ class DocumentAutomationWorkflow:
     async def _extract_key_sections(self, text: str) -> Dict[str, Any]:
         """Extract and categorize key sections"""
         
-        # Define automation keywords
         automation_keywords = {
             'process_words': ['process', 'workflow', 'procedure', 'steps', 'method'],
             'task_words': ['task', 'activity', 'operation', 'action', 'function'],
@@ -507,12 +535,11 @@ class DocumentAutomationWorkflow:
         
         for sentence in sentences:
             sentence = sentence.strip()
-            if len(sentence) < 10:  # Keep all meaningful sentences
+            if len(sentence) < 10:
                 continue
             
             sentence_lower = sentence.lower()
             
-            # Categorize sentences (keep full sentences, no truncation)
             if any(word in sentence_lower for word in automation_keywords['process_words']):
                 sections['process_descriptions'].append(sentence)
                 
@@ -525,7 +552,6 @@ class DocumentAutomationWorkflow:
             if any(word in sentence_lower for word in automation_keywords['decision_words']):
                 sections['decision_rules'].append(sentence)
         
-        # AI-powered key phrases extraction
         ai_key_phrases = await self._extract_ai_key_phrases(text)
         
         return {
@@ -552,7 +578,6 @@ class DocumentAutomationWorkflow:
         response = await self.llm.ainvoke([HumanMessage(content=key_phrases_prompt)])
         ai_response = response.content.strip()
         
-        # Parse comma-separated phrases
         phrases = [phrase.strip() for phrase in ai_response.split(',')]
         clean_phrases = []
         for phrase in phrases:
@@ -562,24 +587,18 @@ class DocumentAutomationWorkflow:
         
         return clean_phrases[:15]
     
-    # AGENT 3: ENHANCED - Comprehensive runbook analysis with 5-metric scoring
+    # AGENT 3: Enhanced automation analysis
     async def _enhanced_automation_analysis_agent(self, state: WorkflowState) -> WorkflowState:
-        """ENHANCED AGENT 3: Comprehensive runbook analysis with 5-metric scoring and improved document generation"""
+        """AGENT 3: Comprehensive runbook analysis with 5-metric scoring"""
         
         print("🤖 Enhanced Automation Analyzer: Performing comprehensive runbook analysis...")
         
         cleaned_text = state['cleaned_content']['cleaned_text']
         
-        # Step 1: Extract structural elements for analysis
         rule_data = self._extract_rule_data(cleaned_text)
-        
-        # Step 2: Perform 5-metric analysis
         scoring_analysis = await self._perform_five_metric_analysis(cleaned_text, rule_data)
-        
-        # Step 3: Generate improved document
         improved_document = await self._generate_improved_actual_document(cleaned_text, scoring_analysis)
         
-        # Combine analysis results
         comprehensive_analysis = {
             **scoring_analysis,
             'rule_data': rule_data,
@@ -596,7 +615,6 @@ class DocumentAutomationWorkflow:
     def _extract_rule_data(self, text: str) -> Dict[str, Any]:
         """Extract structural data for rule-based analysis"""
         
-        # Count commands and analyze structure
         command_patterns = [
             r'\b(run|execute|start|stop|restart|check|verify|validate|install|configure|deploy|backup|restore|copy|move|delete|create|update|modify|monitor)\b',
             r'\b(curl|wget|ssh|scp|grep|awk|sed|find|ps|kill|systemctl|docker|kubectl|git|pip|npm|yarn)\b',
@@ -610,12 +628,9 @@ class DocumentAutomationWorkflow:
             matches = re.findall(pattern, text, re.IGNORECASE)
             commands.extend(matches)
         
-        # Detect quality flags
         vague_terms = re.findall(r'\b(check|verify|ensure|make sure|confirm|validate)\s+(?!with|using|by|via)\w*', text, re.IGNORECASE)
         manual_decisions = re.findall(r'\b(manually|human|approval|review|decide|judgment|discretion|if\s+needed)\b', text, re.IGNORECASE)
         ui_interactions = re.findall(r'\b(click|button|interface|GUI|dashboard|browser|web\s+page)\b', text, re.IGNORECASE)
-        
-        # Analyze logic and decision points
         decision_points = re.findall(r'\b(if|when|unless|depending|based\s+on|in\s+case|should)\b', text, re.IGNORECASE)
         conditional_statements = re.findall(r'\bif\s+.*?then\b', text, re.IGNORECASE)
         
@@ -716,22 +731,164 @@ class DocumentAutomationWorkflow:
         ]
         return round(sum(scores) / len(scores), 1)
     
-    # NEW AGENT 4: Automation Commands Agent
+    # NEW AGENT 4: Similarity Matching Agent
+    async def _similarity_matching_agent(self, state: WorkflowState) -> WorkflowState:
+        """NEW AGENT 4: Find similar existing automations using vector similarity"""
+        
+        print("🔍 Similarity Matching Agent: Finding similar existing automations...")
+        
+        # Check if embedding is enabled
+        if not self.embedding_enabled:
+            print("⚠️ Embedding client not initialized, skipping similarity matching")
+            state['similarity_matches'] = {
+                'document_summary': 'Embedding service not available',
+                'similar_automations': [],
+                'total_matches_found': 0,
+                'error': 'Embedding client not initialized'
+            }
+            state['current_step'] = 'similarity_matching_skipped'
+            return state
+        
+        # Get cleaned content and analysis
+        cleaned_text = state['cleaned_content']['cleaned_text']
+        analysis = state['automation_analysis']
+        
+        try:
+            # Generate document summary
+            document_summary = await self._generate_document_summary(cleaned_text, analysis)
+            
+            # Generate embedding for the document
+            document_embedding = self._generate_embedding(document_summary)
+            
+            # Find similar automations from database
+            if document_embedding:
+                similar_automations = self._find_similar_automations(document_embedding, top_k=5)
+            else:
+                similar_automations = []
+            
+            # Store results
+            state['similarity_matches'] = {
+                'document_summary': document_summary,
+                'similar_automations': similar_automations,
+                'total_matches_found': len(similar_automations)
+            }
+            
+        except Exception as e:
+            print(f"❌ Error in similarity matching: {e}")
+            state['similarity_matches'] = {
+                'document_summary': 'Error generating summary',
+                'similar_automations': [],
+                'total_matches_found': 0,
+                'error': str(e)
+            }
+        
+        state['current_step'] = 'similarity_matching_complete'
+        return state
+
+    async def _generate_document_summary(self, cleaned_text: str, analysis: Dict) -> str:
+        """Generate a comprehensive summary of the document for embedding"""
+        
+        summary_prompt = f"""
+        Create a comprehensive summary of this automation document that captures:
+        1. What the document is about (main purpose)
+        2. What automation/process it describes
+        3. Key steps and procedures
+        4. Technical components and systems involved
+        5. Overall automation goals
+        
+        Be detailed and technical. This summary will be used to find similar automations.
+        
+        DOCUMENT ANALYSIS CONTEXT:
+        - Overall Automation Score: {analysis.get('overall_automation_score', 6)}/10
+        - Automation Feasibility: {analysis.get('automation_feasibility_score', 5)}/10
+        
+        DOCUMENT CONTENT:
+        {cleaned_text[:4000]}
+        
+        Return a comprehensive summary (200-300 words):
+        """
+        
+        response = await self.llm.ainvoke([HumanMessage(content=summary_prompt)])
+        summary = response.content.strip()
+        
+        print(f"📝 Generated document summary ({len(summary)} chars)")
+        return summary
+
+    def _generate_embedding(self, text: str) -> List[float]:
+        """Generate embedding using Azure Ada model"""
+        try:
+            response = self.embedding_client.embeddings.create(
+                input=text,
+                model=self.azure_embedding_config['embedding_deployment']
+            )
+            
+            embedding = response.data[0].embedding
+            print(f"✅ Generated embedding (dimension: {len(embedding)})")
+            return embedding
+            
+        except Exception as e:
+            print(f"❌ Error generating embedding: {e}")
+            return None
+
+    def _find_similar_automations(self, query_embedding: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
+        """Find similar automations using cosine similarity in PostgreSQL"""
+        
+        if not query_embedding:
+            return []
+        
+        try:
+            conn = psycopg2.connect(**self.db_config)
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            
+            # Use cosine similarity (1 - cosine distance)
+            query = """
+                SELECT 
+                    automation_name,
+                    description,
+                    steps,
+                    1 - (embedding <=> %s::vector) AS similarity_score
+                FROM automation_embeddings
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s;
+            """
+            
+            cur.execute(query, (query_embedding, query_embedding, top_k))
+            results = cur.fetchall()
+            
+            cur.close()
+            conn.close()
+            
+            # Convert to list of dicts and calculate percentage
+            similar_automations = []
+            for row in results:
+                similar_automations.append({
+                    'automation_name': row['automation_name'],
+                    'description': row['description'],
+                    'steps': row['steps'],
+                    'similarity_score': float(row['similarity_score']),
+                    'similarity_percentage': round(float(row['similarity_score']) * 100, 2)
+                })
+            
+            print(f"✅ Found {len(similar_automations)} similar automations")
+            return similar_automations
+            
+        except Exception as e:
+            print(f"❌ Error finding similar automations: {e}")
+            return []
+    
+    # AGENT 5: Automation Commands Agent
     async def _automation_commands_agent(self, state: WorkflowState) -> WorkflowState:
-        """NEW AGENT 4: Analyze steps and suggest automation commands"""
+        """AGENT 5: Analyze steps and suggest automation commands"""
         
         print("🤖 Automation Commands Agent: Analyzing steps for automation commands...")
         
         improved_doc = state['improved_document']
         analysis = state['automation_analysis']
         
-        # Get improved document content
         improved_content = improved_doc.get('improved_content', state['cleaned_content']['cleaned_text'])
         
-        # Generate automation commands analysis
         automation_commands = await self._analyze_automation_commands(improved_content, analysis)
         
-        # Store in state
         state['automation_commands'] = automation_commands
         state['current_step'] = 'automation_commands_complete'
         
@@ -790,23 +947,20 @@ class DocumentAutomationWorkflow:
         response = await self.llm.ainvoke([HumanMessage(content=commands_prompt)])
         return json.loads(response.content)
     
-    # NEW AGENT 5: Script Generation Agent (replaces DAG generation)
+    # AGENT 6: Script Generation Agent
     async def _script_generation_agent(self, state: WorkflowState) -> WorkflowState:
-        """NEW AGENT 5: Generate Python automation script based on commands analysis"""
+        """AGENT 6: Generate Python automation script based on commands analysis"""
         
         print("📜 Script Generation Agent: Creating Python automation script...")
         
         automation_commands = state['automation_commands']
         analysis = state['automation_analysis']
         
-        # Determine if script generation is viable
         automation_percentage = automation_commands.get('automation_summary', {}).get('automation_percentage', 0)
         
-        if automation_percentage < 30:  # Low automation threshold
-            # Generate explanation for why script cannot be created
+        if automation_percentage < 30:
             script_data = await self._generate_low_automation_explanation(automation_commands, automation_percentage)
         else:
-            # Generate actual Python script
             script_data = await self._generate_python_automation_script(automation_commands, analysis)
         
         state['generated_script'] = script_data
@@ -902,7 +1056,6 @@ class DocumentAutomationWorkflow:
         response = await self.llm.ainvoke([HumanMessage(content=script_prompt)])
         script_result = json.loads(response.content)
         
-        # Add metadata
         script_result.update({
             'script_type': 'Python Automation Script',
             'automation_viable': True,
@@ -913,15 +1066,13 @@ class DocumentAutomationWorkflow:
         
         return script_result
     
-    # NEW METHOD: Process text documents (non-PDF)
+    # Process methods
     async def process_text_document(self, text_file_path: str) -> Dict[str, Any]:
         """Process text document (non-PDF) through workflow"""
         
-        # Read the text file
         with open(text_file_path, 'r', encoding='utf-8') as f:
             text_content = f.read()
         
-        # Create initial state with text content instead of PDF parsing
         initial_state = WorkflowState(
             pdf_path=text_file_path,
             parsed_content={
@@ -941,25 +1092,19 @@ class DocumentAutomationWorkflow:
             cleaned_content={},
             automation_analysis={},
             improved_document={},
+            similarity_matches={},
             automation_commands={},
             generated_script={},
             messages=[],
             current_step="text_parsing_complete"
         )
         
-        # Skip PDF parsing agent and go directly to cleaning
         print("📝 Processing text input directly...")
         
-        # Run cleaning agent
         initial_state = await self._text_cleaning_agent(initial_state)
-        
-        # Run analysis agent
         initial_state = await self._enhanced_automation_analysis_agent(initial_state)
-        
-        # Run automation commands agent
+        initial_state = await self._similarity_matching_agent(initial_state)
         initial_state = await self._automation_commands_agent(initial_state)
-        
-        # Run script generation agent
         final_state = await self._script_generation_agent(initial_state)
         
         return {
@@ -967,6 +1112,7 @@ class DocumentAutomationWorkflow:
             'cleaned_content': final_state['cleaned_content'],
             'automation_analysis': final_state['automation_analysis'],
             'improved_document': final_state['improved_document'],
+            'similarity_matches': final_state.get('similarity_matches', {}),
             'automation_commands': final_state.get('automation_commands', {}),
             'generated_script': final_state['generated_script']
         }
@@ -980,13 +1126,13 @@ class DocumentAutomationWorkflow:
             cleaned_content={},
             automation_analysis={},
             improved_document={},
+            similarity_matches={},
             automation_commands={},
             generated_script={},
             messages=[],
             current_step="starting"
         )
         
-        # Run the workflow
         final_state = await self.workflow.ainvoke(initial_state)
         
         return {
@@ -994,6 +1140,7 @@ class DocumentAutomationWorkflow:
             'cleaned_content': final_state['cleaned_content'],
             'automation_analysis': final_state['automation_analysis'],
             'improved_document': final_state['improved_document'],
+            'similarity_matches': final_state.get('similarity_matches', {}),
             'automation_commands': final_state.get('automation_commands', {}),
             'generated_script': final_state['generated_script']
         }
