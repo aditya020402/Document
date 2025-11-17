@@ -1,0 +1,201 @@
+import pandas as pd
+import psycopg2
+from psycopg2.extras import execute_values
+import openai
+from openai import AzureOpenAI
+import numpy as np
+from typing import List, Dict
+import time
+
+class ExcelEmbeddingProcessor:
+    def __init__(self, excel_path: str, db_config: Dict[str, str], azure_config: Dict[str, str]):
+        """
+        Initialize the Excel embedding processor
+        
+        Args:
+            excel_path: Path to Excel file with automation data
+            db_config: PostgreSQL database configuration
+            azure_config: Azure OpenAI configuration
+        """
+        self.excel_path = excel_path
+        self.db_config = db_config
+        
+        # Initialize Azure OpenAI client for Ada embeddings
+        self.client = AzureOpenAI(
+            api_key=azure_config['api_key'],
+            api_version=azure_config['api_version'],
+            azure_endpoint=azure_config['endpoint']
+        )
+        self.embedding_model = azure_config['embedding_deployment']  # text-embedding-ada-002
+    
+    def load_excel_data(self) -> pd.DataFrame:
+        """Load automation data from Excel file"""
+        print("📊 Loading Excel data...")
+        
+        # Assuming Excel has columns: automation_name, description, steps
+        df = pd.read_excel(self.excel_path)
+        
+        # Expected columns: automation_name, description, steps
+        required_columns = ['automation_name', 'description', 'steps']
+        
+        if not all(col in df.columns for col in required_columns):
+            raise ValueError(f"Excel must contain columns: {required_columns}")
+        
+        print(f"✅ Loaded {len(df)} automation records")
+        return df
+    
+    def create_combined_text(self, row: pd.Series) -> str:
+        """Combine automation data into single text for embedding"""
+        combined = f"""
+Automation Name: {row['automation_name']}
+
+Description: {row['description']}
+
+Steps:
+{row['steps']}
+        """.strip()
+        return combined
+    
+    def generate_embedding(self, text: str) -> List[float]:
+        """Generate embedding using Azure Ada model"""
+        try:
+            # Azure Ada embeddings
+            response = self.client.embeddings.create(
+                input=text,
+                model=self.embedding_model
+            )
+            
+            embedding = response.data[0].embedding
+            return embedding
+            
+        except Exception as e:
+            print(f"❌ Error generating embedding: {e}")
+            return None
+    
+    def setup_database(self):
+        """Setup PostgreSQL database with pgvector extension"""
+        print("🗄️ Setting up database...")
+        
+        conn = psycopg2.connect(**self.db_config)
+        cur = conn.cursor()
+        
+        # Enable pgvector extension
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        
+        # Create table for automation embeddings
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS automation_embeddings (
+                id SERIAL PRIMARY KEY,
+                automation_name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                steps TEXT NOT NULL,
+                combined_text TEXT NOT NULL,
+                embedding vector(1536),  -- Ada embeddings are 1536 dimensions
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        
+        # Create index for faster similarity search
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS automation_embedding_idx 
+            ON automation_embeddings 
+            USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 100);
+        """)
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        print("✅ Database setup complete")
+    
+    def store_embeddings(self, df: pd.DataFrame):
+        """Generate embeddings and store in database"""
+        print("🔄 Generating embeddings and storing in database...")
+        
+        conn = psycopg2.connect(**self.db_config)
+        cur = conn.cursor()
+        
+        # Clear existing data (optional)
+        cur.execute("TRUNCATE TABLE automation_embeddings RESTART IDENTITY;")
+        
+        embeddings_data = []
+        
+        for idx, row in df.iterrows():
+            print(f"Processing {idx + 1}/{len(df)}: {row['automation_name']}")
+            
+            # Create combined text
+            combined_text = self.create_combined_text(row)
+            
+            # Generate embedding
+            embedding = self.generate_embedding(combined_text)
+            
+            if embedding:
+                embeddings_data.append((
+                    row['automation_name'],
+                    row['description'],
+                    row['steps'],
+                    combined_text,
+                    embedding
+                ))
+            
+            # Rate limiting - pause between requests
+            time.sleep(0.5)
+        
+        # Bulk insert
+        if embeddings_data:
+            execute_values(
+                cur,
+                """
+                INSERT INTO automation_embeddings 
+                (automation_name, description, steps, combined_text, embedding)
+                VALUES %s
+                """,
+                embeddings_data,
+                template="(%s, %s, %s, %s, %s::vector)"
+            )
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        print(f"✅ Stored {len(embeddings_data)} embeddings in database")
+    
+    def process(self):
+        """Main processing pipeline"""
+        print("🚀 Starting Excel embedding processing pipeline...")
+        
+        # Load Excel data
+        df = self.load_excel_data()
+        
+        # Setup database
+        self.setup_database()
+        
+        # Generate and store embeddings
+        self.store_embeddings(df)
+        
+        print("✅ Processing complete!")
+
+# Usage example
+if __name__ == "__main__":
+    # Configuration
+    excel_path = "existing_automations.xlsx"
+    
+    db_config = {
+        'dbname': 'automation_db',
+        'user': 'your_username',
+        'password': 'your_password',
+        'host': 'localhost',
+        'port': '5432'
+    }
+    
+    azure_config = {
+        'api_key': '',
+        'api_version': '',
+        'endpoint': '',
+        'embedding_deployment': ''  # Your Azure deployment name
+    }
+    
+    # Process Excel and create embeddings
+    processor = ExcelEmbeddingProcessor(excel_path, db_config, azure_config)
+    processor.process()
