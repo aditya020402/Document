@@ -1,0 +1,999 @@
+import asyncio
+import re
+from typing import Dict, Any, List, TypedDict
+from langgraph.graph import StateGraph, END, START
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_openai import ChatOpenAI
+import PyPDF2
+import time
+import io
+import fitz  # PyMuPDF for image extraction
+import json
+from datetime import datetime
+from pathlib import Path
+import base64
+
+class WorkflowState(TypedDict):
+    """State schema for the document automation workflow"""
+    pdf_path: str
+    parsed_content: Dict[str, Any]
+    cleaned_content: Dict[str, Any]
+    automation_analysis: Dict[str, Any]
+    improved_document: Dict[str, Any]
+    automation_commands: Dict[str, Any]
+    generated_script: Dict[str, Any]
+    messages: List[Any]
+    current_step: str
+
+class DocumentAutomationWorkflow:
+    def __init__(self):
+        # Initialize LLM with GPT-4o mini for multimodal capabilities
+        self.llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.1,
+            azure_endpoint="your-azure-endpoint",
+            api_key="your-api-key",
+            api_version="2024-07-18"
+        )
+        
+        # Build the workflow graph
+        self.workflow = self._build_workflow()
+    
+    def _build_workflow(self) -> StateGraph:
+        """Build the LangGraph workflow"""
+        
+        # Create state graph
+        workflow = StateGraph(WorkflowState)
+        
+        # Add nodes for the 5-step process
+        workflow.add_node("parse_document", self._parse_document_agent)
+        workflow.add_node("clean_text", self._text_cleaning_agent)
+        workflow.add_node("analyze_automation", self._enhanced_automation_analysis_agent)
+        workflow.add_node("automation_commands", self._automation_commands_agent)
+        workflow.add_node("generate_script", self._script_generation_agent)
+        
+        # Add edges
+        workflow.add_edge(START, "parse_document")
+        workflow.add_edge("parse_document", "clean_text")
+        workflow.add_edge("clean_text", "analyze_automation")
+        workflow.add_edge("analyze_automation", "automation_commands")
+        workflow.add_edge("automation_commands", "generate_script")
+        workflow.add_edge("generate_script", END)
+        
+        return workflow.compile()
+    
+    # AGENT 1: Parse PDF using multimodal GPT
+    async def _parse_document_agent(self, state: WorkflowState) -> WorkflowState:
+        """Agent 1: Parse PDF and extract text + multimodal image analysis"""
+        
+        print("🔍 Document Parser Agent: Processing PDF with multimodal GPT-4o mini...")
+        
+        # Process each page sequentially to maintain order
+        combined_content = await self._extract_content_by_page(state['pdf_path'])
+        
+        # Update state with properly ordered content
+        state['parsed_content'] = {
+            'combined_text': combined_content['full_text'],
+            'page_breakdown': combined_content['pages'],
+            'total_pages': combined_content['total_pages'],
+            'processing_summary': combined_content['summary'],
+            'image_analysis': combined_content.get('image_analysis', [])
+        }
+        state['current_step'] = 'parsing_complete'
+        
+        return state
+    
+    async def _extract_content_by_page(self, pdf_path: str) -> Dict[str, Any]:
+        """Extract text and images page by page using multimodal GPT-4o mini - FIXED"""
+        
+        combined_text = ""
+        page_details = []
+        image_analysis = []
+        
+        # Open PDF with PyMuPDF for comprehensive processing
+        doc = fitz.open(pdf_path)
+        total_pages = len(doc)
+        
+        print(f"Processing {total_pages} pages with multimodal GPT-4o mini...")
+        
+        for page_num in range(total_pages):
+            print(f"Processing page {page_num + 1}/{total_pages}...")
+            
+            page = doc.load_page(page_num)
+            
+            # Step 1: Extract text content using PyMuPDF with proper sorting
+            text_dict = page.get_text("dict", sort=True)
+            page_text_content = self._extract_text_from_page_dict(text_dict)
+            
+            # Step 2: FIXED - Use multimodal GPT for images and embed descriptions
+            image_list = page.get_images()
+            page_multimodal_content = ""
+            page_image_analysis = []
+            
+            if image_list:
+                print(f"Found {len(image_list)} images on page {page_num + 1}, processing with multimodal GPT...")
+                for img_index, img in enumerate(image_list):
+                    try:
+                        # Extract image
+                        xref = img[0]
+                        pix = fitz.Pixmap(doc, xref)
+                        
+                        if pix.n - pix.alpha < 4:  # GRAY or RGB
+                            img_data = pix.tobytes("png")
+                            
+                            # FIXED: Use multimodal GPT and properly handle results
+                            multimodal_result = await self._perform_multimodal_analysis(img_data, page_num + 1, img_index + 1)
+                            
+                            # FIXED: Always add image analysis to content, even if no text extracted
+                            image_content_block = f"\n[IMAGE_{img_index + 1}_ANALYSIS]:\n"
+                            image_content_block += f"Description: {multimodal_result['description']}\n"
+                            image_content_block += f"Purpose: {multimodal_result['purpose']}\n"
+                            image_content_block += f"Automation Relevance: {multimodal_result['automation_relevance']}\n"
+                            
+                            # Add extracted text if available
+                            if multimodal_result['extracted_text'].strip():
+                                image_content_block += f"Extracted Text: {multimodal_result['extracted_text']}\n"
+                            else:
+                                image_content_block += "Extracted Text: No text detected in image\n"
+                            
+                            image_content_block += f"[END_IMAGE_{img_index + 1}_ANALYSIS]\n"
+                            
+                            # Add to page content
+                            page_multimodal_content += image_content_block
+                            
+                            # Add image analysis for frontend display
+                            page_image_analysis.append({
+                                'page': page_num + 1,
+                                'image_index': img_index + 1,
+                                'extracted_text': multimodal_result['extracted_text'],
+                                'image_description': multimodal_result['description'],
+                                'purpose': multimodal_result['purpose'],
+                                'automation_relevance': multimodal_result['automation_relevance']
+                            })
+                        
+                        pix = None
+                        
+                    except Exception as e:
+                        print(f"Error processing image {img_index + 1} on page {page_num + 1}: {e}")
+                        # Add error information to content
+                        error_block = f"\n[IMAGE_{img_index + 1}_ERROR]: Failed to process image - {str(e)}\n"
+                        page_multimodal_content += error_block
+            
+            # Step 3: FIXED - Combine text and multimodal content with proper integration
+            page_combined = f"\n--- PAGE {page_num + 1} ---\n"
+            page_combined += page_text_content
+            
+            # FIXED: Always add image analysis section if there are images
+            if image_list:
+                page_combined += f"\n--- IMAGES ANALYSIS FOR PAGE {page_num + 1} ---\n"
+                page_combined += page_multimodal_content
+                page_combined += f"--- END IMAGES ANALYSIS FOR PAGE {page_num + 1} ---\n"
+            
+            page_combined += f"\n--- END PAGE {page_num + 1} ---\n\n"
+            
+            # Add to combined text
+            combined_text += page_combined
+            
+            # FIXED: Store page details with correct multimodal content length
+            page_details.append({
+                'page_number': page_num + 1,
+                'text_length': len(page_text_content),
+                'image_count': len(image_list),
+                'multimodal_content_length': len(page_multimodal_content),  # FIXED: Now correctly calculated
+                'combined_length': len(page_combined)
+            })
+            
+            # Add image analysis to results
+            image_analysis.extend(page_image_analysis)
+        
+        doc.close()
+        
+        processing_summary = {
+            'total_text_length': len(combined_text),
+            'pages_with_images': sum(1 for p in page_details if p['image_count'] > 0),
+            'total_images': sum(p['image_count'] for p in page_details),
+            'pages_with_multimodal_content': sum(1 for p in page_details if p['multimodal_content_length'] > 0),
+            'image_analysis_count': len(image_analysis)
+        }
+        
+        return {
+            'full_text': combined_text,
+            'pages': page_details,
+            'total_pages': total_pages,
+            'summary': processing_summary,
+            'image_analysis': image_analysis
+        }
+    
+    def _extract_text_from_page_dict(self, text_dict: Dict) -> str:
+        """Extract text from PyMuPDF text dictionary in proper order"""
+        
+        text_content = ""
+        
+        # Process blocks in order (already sorted by get_text with sort=True)
+        for block in text_dict.get("blocks", []):
+            if "lines" in block:  # Text block
+                for line in block["lines"]:
+                    line_text = ""
+                    for span in line.get("spans", []):
+                        line_text += span.get("text", "")
+                    if line_text.strip():
+                        text_content += line_text + "\n"
+        
+        return text_content
+    
+    async def _perform_multimodal_analysis(self, image_data: bytes, page_num: int, img_num: int) -> Dict[str, str]:
+        """FIXED: Perform multimodal analysis using GPT-4o mini with better error handling"""
+        
+        try:
+            # Convert image to base64
+            img_base64 = base64.b64encode(image_data).decode('utf-8')
+            
+            # ENHANCED: Create more detailed multimodal prompt
+            multimodal_prompt = f"""
+            Analyze this image from page {page_num}, image {img_num} of a technical/business document and provide detailed information:
+
+            1. **Extract ALL visible text** - Transcribe every piece of text you can see, including:
+               - Labels, titles, headings
+               - Body text, descriptions
+               - Code snippets, commands
+               - Menu items, button text
+               - Technical terms, parameters
+               - Numbers, dates, values
+            
+            2. **Describe what the image shows** - Be specific about:
+               - Type of content (screenshot, diagram, chart, flowchart, etc.)
+               - Visual elements and layout
+               - Technical components shown
+               - User interface elements if applicable
+            
+            3. **Explain the purpose** - Why this image is included:
+               - What process or concept it illustrates
+               - How it supports the document's content
+               - What information it conveys
+            
+            4. **Automation relevance** - How it relates to automation:
+               - Automatable processes shown
+               - Technical workflows depicted
+               - System interactions visible
+               - Commands or APIs that could be automated
+
+            Be thorough and detailed. If you see any text, extract ALL of it completely.
+
+            Format your response EXACTLY as:
+            EXTRACTED_TEXT: [transcribe ALL visible text here, be comprehensive]
+            IMAGE_DESCRIPTION: [detailed description of what the image shows]
+            PURPOSE: [why this image is in the document and what it illustrates]
+            AUTOMATION_RELEVANCE: [detailed analysis of automation potential]
+            """
+            
+            # Prepare message content
+            message_content = [
+                {
+                    "type": "text",
+                    "text": multimodal_prompt
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{img_base64}",
+                        "detail": "high"  # High detail for better text extraction
+                    }
+                }
+            ]
+            
+            # Call GPT-4o mini
+            print(f"🔍 Analyzing image {img_num} on page {page_num} with GPT-4o mini...")
+            response = await self.llm.ainvoke([HumanMessage(content=message_content)])
+            
+            if not response or not response.content:
+                print(f"⚠️ Empty response from GPT-4o mini for image {img_num}")
+                return {
+                    'extracted_text': '',
+                    'description': 'Empty response from multimodal analysis',
+                    'purpose': 'Analysis failed',
+                    'automation_relevance': 'Could not analyze'
+                }
+            
+            # FIXED: Better parsing of the response
+            content = response.content.strip()
+            print(f"✅ GPT-4o mini response length: {len(content)} characters")
+            
+            # Extract each section with improved parsing
+            extracted_text = ""
+            description = ""
+            purpose = ""
+            automation_relevance = ""
+            
+            # Parse line by line for better extraction
+            lines = content.split('\n')
+            current_section = None
+            
+            for line in lines:
+                line = line.strip()
+                if line.startswith('EXTRACTED_TEXT:'):
+                    current_section = 'text'
+                    extracted_text = line.replace('EXTRACTED_TEXT:', '').strip()
+                elif line.startswith('IMAGE_DESCRIPTION:'):
+                    current_section = 'description'
+                    description = line.replace('IMAGE_DESCRIPTION:', '').strip()
+                elif line.startswith('PURPOSE:'):
+                    current_section = 'purpose'
+                    purpose = line.replace('PURPOSE:', '').strip()
+                elif line.startswith('AUTOMATION_RELEVANCE:'):
+                    current_section = 'relevance'
+                    automation_relevance = line.replace('AUTOMATION_RELEVANCE:', '').strip()
+                elif line and current_section:
+                    # Continue building the current section
+                    if current_section == 'text':
+                        extracted_text += ' ' + line
+                    elif current_section == 'description':
+                        description += ' ' + line
+                    elif current_section == 'purpose':
+                        purpose += ' ' + line
+                    elif current_section == 'relevance':
+                        automation_relevance += ' ' + line
+            
+            # Clean up the extracted content
+            extracted_text = extracted_text.strip()
+            description = description.strip() if description.strip() else 'Visual content detected but description not provided'
+            purpose = purpose.strip() if purpose.strip() else 'Purpose analysis not available'
+            automation_relevance = automation_relevance.strip() if automation_relevance.strip() else 'Automation analysis not available'
+            
+            print(f"📊 Image {img_num} analysis - Text extracted: {len(extracted_text)} chars")
+            
+            return {
+                'extracted_text': extracted_text,
+                'description': description,
+                'purpose': purpose,
+                'automation_relevance': automation_relevance
+            }
+            
+        except Exception as e:
+            print(f"❌ Multimodal GPT analysis error for image {img_num}: {e}")
+            return {
+                'extracted_text': '',
+                'description': f'Error in multimodal analysis: {str(e)}',
+                'purpose': 'Analysis failed due to error',
+                'automation_relevance': f'Error occurred: {str(e)}'
+            }
+    
+    # AGENT 2: Clean and preprocess extracted text
+    async def _text_cleaning_agent(self, state: WorkflowState) -> WorkflowState:
+        """Agent 2: Clean and preprocess extracted text"""
+        
+        print("🧹 Text Cleaning Agent: Removing noise and irrelevant content...")
+        
+        raw_text = state['parsed_content']['combined_text']
+        
+        # Step 1: Basic regex cleaning
+        cleaned_text = self._basic_text_cleaning(raw_text)
+        
+        # Step 2: AI-powered filtering
+        filtered_text = await self._ai_content_filtering(cleaned_text)
+        
+        # Step 3: Remove headers/footers
+        final_text = self._remove_headers_footers(filtered_text)
+        
+        # Step 4: Extract key sections
+        structured_content = await self._extract_key_sections(final_text)
+        
+        # Calculate cleaning statistics
+        cleaning_stats = {
+            'original_length': len(raw_text),
+            'cleaned_length': len(final_text),
+            'reduction_percentage': round((len(raw_text) - len(final_text)) / len(raw_text) * 100, 2) if len(raw_text) > 0 else 0,
+            'sections_identified': len([s for s in structured_content['sections'].values() if s]),
+            'key_phrases_found': len(structured_content.get('key_phrases', []))
+        }
+        
+        state['cleaned_content'] = {
+            'cleaned_text': final_text,
+            'structured_content': structured_content,
+            'image_analysis': state['parsed_content'].get('image_analysis', []),
+            'cleaning_stats': cleaning_stats,
+            'removed_elements': {
+                'headers_footers': True,
+                'page_numbers': True,
+                'ocr_noise': True,
+                'repetitive_content': True
+            }
+        }
+        
+        state['current_step'] = 'cleaning_complete'
+        return state
+    
+    def _basic_text_cleaning(self, text: str) -> str:
+        """UPDATED: Perform basic regex-based text cleaning while preserving image analysis"""
+        
+        # Remove page markers but preserve image analysis blocks
+        text = re.sub(r'--- PAGE \d+ ---', '', text)
+        text = re.sub(r'--- END PAGE \d+ ---', '', text)
+        
+        # CHANGED: Don't remove image analysis markers - keep them for automation analysis
+        # Preserve [IMAGE_X_ANALYSIS] blocks
+        
+        # Remove common OCR noise patterns but be more careful around image blocks
+        ocr_noise_patterns = [
+            r'\b[A-Z]{1}\s+[A-Z]{1}\s+[A-Z]{1}\b',  # Scattered single letters
+            r'\b\d{1}\s+\d{1}\s+\d{1}\b',  # Scattered single digits
+            r'[|¦!]{3,}',  # Multiple vertical bars/pipes (changed from 2+ to 3+)
+            r'_{4,}',  # Multiple underscores (changed from 3+ to 4+)
+            r'-{6,}',  # Multiple dashes (changed from 5+ to 6+)
+            r'\s{4,}',  # Multiple spaces (changed from 3+ to 4+)
+        ]
+        
+        for pattern in ocr_noise_patterns:
+            text = re.sub(pattern, ' ', text)
+        
+        # Remove common header/footer patterns
+        header_footer_patterns = [
+            r'Page \d+ of \d+',
+            r'Page \d+',
+            r'©.*?\d{4}',
+            r'Confidential.*?$',
+            r'Document.*?Version.*?\d+',
+        ]
+        
+        for pattern in header_footer_patterns:
+            text = re.sub(pattern, '', text, flags=re.MULTILINE | re.IGNORECASE)
+        
+        # Clean up whitespace but preserve image analysis structure
+        text = re.sub(r'\n\s*\n\s*\n', '\n\n', text)  # Multiple newlines to double
+        text = re.sub(r' +', ' ', text)  # Multiple spaces to single
+        text = text.strip()
+        
+        return text
+    
+    async def _ai_content_filtering(self, text: str) -> str:
+        """Use AI to identify and filter relevant content"""
+        
+        if len(text) > 8000:
+            text = text[:8000]
+        
+        filtering_prompt = f"""
+        Clean this document text for automation analysis. Remove headers, footers, page numbers, and OCR noise.
+        Keep: process descriptions, tasks, workflows, data definitions, business rules, image analysis blocks.
+        Return only the cleaned text:
+
+        {text}
+        """
+        
+        response = await self.llm.ainvoke([HumanMessage(content=filtering_prompt)])
+        return response.content.strip()
+    
+    def _remove_headers_footers(self, text: str) -> str:
+        """Remove repeated headers and footers"""
+        
+        lines = text.split('\n')
+        if len(lines) < 10:
+            return text
+        
+        # Simple approach: remove very short lines that appear multiple times
+        line_counts = {}
+        for line in lines:
+            clean_line = re.sub(r'\d+', 'NUM', line.strip())
+            if 5 < len(clean_line) < 50:
+                line_counts[clean_line] = line_counts.get(clean_line, 0) + 1
+        
+        # Remove lines that appear 3+ times
+        repetitive_patterns = {line for line, count in line_counts.items() if count >= 3}
+        
+        filtered_lines = []
+        for line in lines:
+            clean_line = re.sub(r'\d+', 'NUM', line.strip())
+            if clean_line not in repetitive_patterns:
+                filtered_lines.append(line)
+        
+        return '\n'.join(filtered_lines)
+    
+    async def _extract_key_sections(self, text: str) -> Dict[str, Any]:
+        """Extract and categorize key sections"""
+        
+        # Define automation keywords
+        automation_keywords = {
+            'process_words': ['process', 'workflow', 'procedure', 'steps', 'method'],
+            'task_words': ['task', 'activity', 'operation', 'action', 'function'],
+            'data_words': ['data', 'information', 'input', 'output', 'field', 'form'],
+            'decision_words': ['if', 'when', 'condition', 'criteria', 'rule']
+        }
+        
+        sentences = re.split(r'[.!?]+', text)
+        sections = {
+            'process_descriptions': [],
+            'task_instructions': [],
+            'data_definitions': [],
+            'decision_rules': []
+        }
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) < 10:  # Keep all meaningful sentences
+                continue
+            
+            sentence_lower = sentence.lower()
+            
+            # Categorize sentences (keep full sentences, no truncation)
+            if any(word in sentence_lower for word in automation_keywords['process_words']):
+                sections['process_descriptions'].append(sentence)
+                
+            if any(word in sentence_lower for word in automation_keywords['task_words']):
+                sections['task_instructions'].append(sentence)
+                
+            if any(word in sentence_lower for word in automation_keywords['data_words']):
+                sections['data_definitions'].append(sentence)
+                
+            if any(word in sentence_lower for word in automation_keywords['decision_words']):
+                sections['decision_rules'].append(sentence)
+        
+        # AI-powered key phrases extraction
+        ai_key_phrases = await self._extract_ai_key_phrases(text)
+        
+        return {
+            'sections': sections,
+            'key_phrases': ai_key_phrases,
+            'relevant_sentences': [s for s in sentences if len(s.strip()) > 10]
+        }
+
+    async def _extract_ai_key_phrases(self, text: str) -> List[str]:
+        """Extract automation-related key phrases using AI"""
+        
+        analysis_text = text[:4000] if len(text) > 4000 else text
+        
+        key_phrases_prompt = f"""
+        Analyze this document text and extract 10-15 key phrases that are most relevant for automation.
+        Focus on: technical terms, process names, tools, commands, systems, workflows, and automation concepts.
+        
+        Return only the key phrases as a simple comma-separated list (no explanations):
+        
+        Document text:
+        {analysis_text}
+        """
+        
+        response = await self.llm.ainvoke([HumanMessage(content=key_phrases_prompt)])
+        ai_response = response.content.strip()
+        
+        # Parse comma-separated phrases
+        phrases = [phrase.strip() for phrase in ai_response.split(',')]
+        clean_phrases = []
+        for phrase in phrases:
+            clean_phrase = phrase.strip('"\'').strip()
+            if len(clean_phrase) > 2 and len(clean_phrase) < 50:
+                clean_phrases.append(clean_phrase)
+        
+        return clean_phrases[:15]
+    
+    # AGENT 3: ENHANCED - Comprehensive runbook analysis with 5-metric scoring
+    async def _enhanced_automation_analysis_agent(self, state: WorkflowState) -> WorkflowState:
+        """ENHANCED AGENT 3: Comprehensive runbook analysis with 5-metric scoring and improved document generation"""
+        
+        print("🤖 Enhanced Automation Analyzer: Performing comprehensive runbook analysis...")
+        
+        cleaned_text = state['cleaned_content']['cleaned_text']
+        
+        # Step 1: Extract structural elements for analysis
+        rule_data = self._extract_rule_data(cleaned_text)
+        
+        # Step 2: Perform 5-metric analysis
+        scoring_analysis = await self._perform_five_metric_analysis(cleaned_text, rule_data)
+        
+        # Step 3: Generate improved document
+        improved_document = await self._generate_improved_actual_document(cleaned_text, scoring_analysis)
+        
+        # Combine analysis results
+        comprehensive_analysis = {
+            **scoring_analysis,
+            'rule_data': rule_data,
+            'overall_automation_score': self._calculate_overall_score(scoring_analysis),
+            'improvement_recommendations': scoring_analysis.get('improvement_recommendations', [])
+        }
+        
+        state['automation_analysis'] = comprehensive_analysis
+        state['improved_document'] = improved_document
+        state['current_step'] = 'enhanced_analysis_complete'
+        
+        return state
+    
+    def _extract_rule_data(self, text: str) -> Dict[str, Any]:
+        """Extract structural data for rule-based analysis"""
+        
+        # Count commands and analyze structure
+        command_patterns = [
+            r'\b(run|execute|start|stop|restart|check|verify|validate|install|configure|deploy|backup|restore|copy|move|delete|create|update|modify|monitor)\b',
+            r'\b(curl|wget|ssh|scp|grep|awk|sed|find|ps|kill|systemctl|docker|kubectl|git|pip|npm|yarn)\b',
+            r'\$\s*\w+',
+            r'``````',
+            r'`[^`]+`'
+        ]
+        
+        commands = []
+        for pattern in command_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            commands.extend(matches)
+        
+        # Detect quality flags
+        vague_terms = re.findall(r'\b(check|verify|ensure|make sure|confirm|validate)\s+(?!with|using|by|via)\w*', text, re.IGNORECASE)
+        manual_decisions = re.findall(r'\b(manually|human|approval|review|decide|judgment|discretion|if\s+needed)\b', text, re.IGNORECASE)
+        ui_interactions = re.findall(r'\b(click|button|interface|GUI|dashboard|browser|web\s+page)\b', text, re.IGNORECASE)
+        
+        # Analyze logic and decision points
+        decision_points = re.findall(r'\b(if|when|unless|depending|based\s+on|in\s+case|should)\b', text, re.IGNORECASE)
+        conditional_statements = re.findall(r'\bif\s+.*?then\b', text, re.IGNORECASE)
+        
+        return {
+            'commands': {
+                'total_commands': len(commands),
+                'unique_commands': len(set(commands)),
+                'command_types': list(set(commands))
+            },
+            'quality_flags': {
+                'vague_terms': len(vague_terms),
+                'manual_decisions': len(manual_decisions),
+                'ui_interactions': len(ui_interactions),
+                'vague_terms_list': vague_terms,
+                'manual_decisions_list': manual_decisions
+            },
+            'logic_structure': {
+                'decision_points': len(decision_points),
+                'conditional_statements': len(conditional_statements),
+                'decision_list': decision_points
+            }
+        }
+    
+    async def _perform_five_metric_analysis(self, text: str, rule_data: Dict) -> Dict[str, Any]:
+        """Perform comprehensive 5-metric runbook analysis"""
+        
+        analysis_prompt = f"""
+        You are an expert runbook automation analyst. Score this runbook on 5 metrics (0-10 scale) for automation feasibility.
+
+        RULE DATA ANALYSIS:
+        - Total Commands Found: {rule_data['commands']['total_commands']}
+        - Vague Terms Found: {rule_data['quality_flags']['vague_terms']}
+        - Manual Decision Points: {rule_data['quality_flags']['manual_decisions']}
+        - UI Interactions: {rule_data['quality_flags']['ui_interactions']}
+        - Decision Points: {rule_data['logic_structure']['decision_points']}
+
+        Return your analysis as a JSON object with this exact structure:
+        {{
+            "clarity_score": <number 0-10>,
+            "clarity_reasoning": "<explanation>",
+            "determinism_score": <number 0-10>,
+            "determinism_reasoning": "<explanation>",
+            "logic_decision_score": <number 0-10>,
+            "logic_decision_reasoning": "<explanation>",
+            "automation_feasibility_score": <number 0-10>,
+            "automation_feasibility_reasoning": "<explanation>",
+            "observability_score": <number 0-10>,
+            "observability_reasoning": "<explanation>",
+            "improvement_recommendations": ["<rec1>", "<rec2>", "<rec3>"],
+            "critical_issues": ["<issue1>", "<issue2>"],
+            "quick_wins": ["<win1>", "<win2>"]
+        }}
+
+        RUNBOOK CONTENT:
+        {text[:6000]}
+        """
+        
+        response = await self.llm.ainvoke([HumanMessage(content=analysis_prompt)])
+        return json.loads(response.content)
+    
+    async def _generate_improved_actual_document(self, original_text: str, analysis: Dict) -> Dict[str, Any]:
+        """Generate an improved version of the ACTUAL document"""
+        
+        improvement_prompt = f"""
+        Based on the automation analysis, improve the ACTUAL document content by addressing identified issues.
+        
+        Return JSON with this structure:
+        {{
+            "improved_content": "<the improved document text>",
+            "improvements_made": ["<improvement1>", "<improvement2>"],
+            "automation_score_increase": <number>,
+            "new_clarity_score": <number>,
+            "new_determinism_score": <number>,
+            "new_automation_feasibility": <number>
+        }}
+
+        ANALYSIS SUMMARY:
+        - Clarity Score: {analysis.get('clarity_score', 5)}/10
+        - Determinism Score: {analysis.get('determinism_score', 5)}/10
+        - Automation Feasibility: {analysis.get('automation_feasibility_score', 5)}/10
+        - Improvement Recommendations: {analysis.get('improvement_recommendations', [])}
+
+        ORIGINAL DOCUMENT CONTENT:
+        {original_text}
+        """
+        
+        response = await self.llm.ainvoke([HumanMessage(content=improvement_prompt)])
+        return json.loads(response.content)
+    
+    def _calculate_overall_score(self, analysis: Dict) -> float:
+        """Calculate overall automation score from 5 metrics"""
+        scores = [
+            analysis.get('clarity_score', 5),
+            analysis.get('determinism_score', 5), 
+            analysis.get('logic_decision_score', 5),
+            analysis.get('automation_feasibility_score', 5),
+            analysis.get('observability_score', 5)
+        ]
+        return round(sum(scores) / len(scores), 1)
+    
+    # NEW AGENT 4: Automation Commands Agent
+    async def _automation_commands_agent(self, state: WorkflowState) -> WorkflowState:
+        """NEW AGENT 4: Analyze steps and suggest automation commands"""
+        
+        print("🤖 Automation Commands Agent: Analyzing steps for automation commands...")
+        
+        improved_doc = state['improved_document']
+        analysis = state['automation_analysis']
+        
+        # Get improved document content
+        improved_content = improved_doc.get('improved_content', state['cleaned_content']['cleaned_text'])
+        
+        # Generate automation commands analysis
+        automation_commands = await self._analyze_automation_commands(improved_content, analysis)
+        
+        # Store in state
+        state['automation_commands'] = automation_commands
+        state['current_step'] = 'automation_commands_complete'
+        
+        return state
+    
+    async def _analyze_automation_commands(self, content: str, analysis: Dict) -> Dict[str, Any]:
+        """Analyze steps and suggest automation commands"""
+        
+        commands_prompt = f"""
+        Analyze the improved document content and suggest specific automation commands for each step.
+        
+        For each identifiable step/task, provide:
+        1. **Linux Commands**: Specific bash/shell commands that can automate this step
+        2. **Windows Commands**: PowerShell or CMD commands for Windows automation  
+        3. **SQL Commands**: If database operations are involved
+        4. **Other Commands**: API calls, Python commands, etc.
+        5. **UI-Only Tasks**: Steps that require pure UI interaction with no command alternative
+        
+        Return JSON with this structure:
+        {{
+            "automatable_steps": [
+                {{
+                    "step_description": "<description of the step>",
+                    "linux_commands": ["<cmd1>", "<cmd2>"],
+                    "windows_commands": ["<cmd1>", "<cmd2>"],
+                    "sql_commands": ["<sql1>", "<sql2>"],
+                    "other_commands": ["<other1>", "<other2>"],
+                    "automation_level": "<High/Medium/Low>",
+                    "notes": "<additional automation notes>"
+                }}
+            ],
+            "ui_only_tasks": [
+                {{
+                    "step_description": "<description>",
+                    "reason": "<why no command automation possible>",
+                    "alternative_suggestion": "<possible workaround if any>"
+                }}
+            ],
+            "automation_summary": {{
+                "total_steps": <number>,
+                "automatable_steps": <number>,
+                "ui_only_steps": <number>,
+                "automation_percentage": <0-100>,
+                "complexity_level": "<High/Medium/Low>"
+            }}
+        }}
+
+        DOCUMENT ANALYSIS CONTEXT:
+        - Overall Automation Score: {analysis.get('overall_automation_score', 6)}/10
+        - Automation Feasibility: {analysis.get('automation_feasibility_score', 5)}/10
+        
+        IMPROVED DOCUMENT CONTENT:
+        {content[:4000]}
+        """
+        
+        response = await self.llm.ainvoke([HumanMessage(content=commands_prompt)])
+        return json.loads(response.content)
+    
+    # NEW AGENT 5: Script Generation Agent (replaces DAG generation)
+    async def _script_generation_agent(self, state: WorkflowState) -> WorkflowState:
+        """NEW AGENT 5: Generate Python automation script based on commands analysis"""
+        
+        print("📜 Script Generation Agent: Creating Python automation script...")
+        
+        automation_commands = state['automation_commands']
+        analysis = state['automation_analysis']
+        
+        # Determine if script generation is viable
+        automation_percentage = automation_commands.get('automation_summary', {}).get('automation_percentage', 0)
+        
+        if automation_percentage < 30:  # Low automation threshold
+            # Generate explanation for why script cannot be created
+            script_data = await self._generate_low_automation_explanation(automation_commands, automation_percentage)
+        else:
+            # Generate actual Python script
+            script_data = await self._generate_python_automation_script(automation_commands, analysis)
+        
+        state['generated_script'] = script_data
+        state['current_step'] = 'complete'
+        
+        return state
+    
+    async def _generate_low_automation_explanation(self, automation_commands: Dict, percentage: int) -> Dict[str, Any]:
+        """Generate explanation when automation threshold is too low"""
+        
+        ui_tasks = automation_commands.get('ui_only_tasks', [])
+        
+        explanation = f"""
+# Automation Script Generation - Insufficient Automation Level
+
+## Analysis Results
+- **Automation Percentage**: {percentage}%
+- **Threshold Required**: 30% minimum
+- **Status**: Script generation not recommended
+
+## Reasons for Low Automation Score:
+
+"""
+        
+        for i, ui_task in enumerate(ui_tasks, 1):
+            explanation += f"{i}. **{ui_task.get('step_description', 'UI Task')}**\n"
+            explanation += f"   - Reason: {ui_task.get('reason', 'Manual interaction required')}\n"
+            explanation += f"   - Alternative: {ui_task.get('alternative_suggestion', 'No automated alternative available')}\n\n"
+        
+        explanation += """
+## Recommendations:
+1. Review document for more specific technical steps
+2. Replace UI interactions with API calls or CLI commands where possible
+3. Add more detailed technical procedures
+4. Consider breaking down complex manual steps into smaller automatable tasks
+
+## Next Steps:
+- Improve document with more technical details
+- Add specific commands and API endpoints
+- Reduce dependency on manual UI interactions
+"""
+        
+        return {
+            'script_type': 'Analysis Report',
+            'automation_viable': False,
+            'automation_percentage': percentage,
+            'explanation': explanation,
+            'recommendations': [
+                'Add more technical implementation details',
+                'Replace UI steps with command-line alternatives',
+                'Include API endpoints and technical specifications',
+                'Break down complex manual processes'
+            ],
+            'threshold_met': False,
+            'code': None,
+            'requirements': None,
+            'execution_steps': None
+        }
+    
+    async def _generate_python_automation_script(self, automation_commands: Dict, analysis: Dict) -> Dict[str, Any]:
+        """Generate actual Python automation script"""
+        
+        script_prompt = f"""
+        Generate a complete Python automation script based on the automation commands analysis.
+        
+        Return JSON with this structure:
+        {{
+            "code": "<complete python script>",
+            "requirements": ["<package1>", "<package2>"],
+            "execution_steps": ["<step1>", "<step2>"],
+            "parameters_required": ["<param1>", "<param2>"],
+            "script_description": "<description of what the script does>",
+            "automation_coverage": "<percentage of tasks automated>",
+            "manual_steps_remaining": ["<step1>", "<step2>"],
+            "notes": "<important usage notes>"
+        }}
+        
+        Create a robust Python script that:
+        1. Handles the automatable steps identified
+        2. Uses appropriate Python libraries (requests, subprocess, os, etc.)
+        3. Includes proper error handling
+        4. Has clear logging and output
+        5. Supports both Linux and Windows where possible
+        6. Includes parameter validation
+        7. Has clear documentation
+
+        AUTOMATION COMMANDS ANALYSIS:
+        {json.dumps(automation_commands, indent=2)}
+        
+        OVERALL AUTOMATION SCORE: {analysis.get('overall_automation_score', 6)}/10
+        """
+        
+        response = await self.llm.ainvoke([HumanMessage(content=script_prompt)])
+        script_result = json.loads(response.content)
+        
+        # Add metadata
+        script_result.update({
+            'script_type': 'Python Automation Script',
+            'automation_viable': True,
+            'automation_percentage': automation_commands.get('automation_summary', {}).get('automation_percentage', 70),
+            'threshold_met': True,
+            'explanation': None
+        })
+        
+        return script_result
+    
+    # NEW METHOD: Process text documents (non-PDF)
+    async def process_text_document(self, text_file_path: str) -> Dict[str, Any]:
+        """Process text document (non-PDF) through workflow"""
+        
+        # Read the text file
+        with open(text_file_path, 'r', encoding='utf-8') as f:
+            text_content = f.read()
+        
+        # Create initial state with text content instead of PDF parsing
+        initial_state = WorkflowState(
+            pdf_path=text_file_path,
+            parsed_content={
+                'combined_text': text_content,
+                'page_breakdown': [],
+                'total_pages': 1,
+                'processing_summary': {
+                    'total_text_length': len(text_content),
+                    'pages_with_images': 0,
+                    'total_images': 0,
+                    'pages_with_multimodal_content': 0,
+                    'image_analysis_count': 0,
+                    'input_type': 'text'
+                },
+                'image_analysis': []
+            },
+            cleaned_content={},
+            automation_analysis={},
+            improved_document={},
+            automation_commands={},
+            generated_script={},
+            messages=[],
+            current_step="text_parsing_complete"
+        )
+        
+        # Skip PDF parsing agent and go directly to cleaning
+        print("📝 Processing text input directly...")
+        
+        # Run cleaning agent
+        initial_state = await self._text_cleaning_agent(initial_state)
+        
+        # Run analysis agent
+        initial_state = await self._enhanced_automation_analysis_agent(initial_state)
+        
+        # Run automation commands agent
+        initial_state = await self._automation_commands_agent(initial_state)
+        
+        # Run script generation agent
+        final_state = await self._script_generation_agent(initial_state)
+        
+        return {
+            'parsed_content': final_state['parsed_content'],
+            'cleaned_content': final_state['cleaned_content'],
+            'automation_analysis': final_state['automation_analysis'],
+            'improved_document': final_state['improved_document'],
+            'automation_commands': final_state.get('automation_commands', {}),
+            'generated_script': final_state['generated_script']
+        }
+    
+    async def process_document(self, pdf_path: str) -> Dict[str, Any]:
+        """Process PDF document through enhanced workflow"""
+        
+        initial_state = WorkflowState(
+            pdf_path=pdf_path,
+            parsed_content={},
+            cleaned_content={},
+            automation_analysis={},
+            improved_document={},
+            automation_commands={},
+            generated_script={},
+            messages=[],
+            current_step="starting"
+        )
+        
+        # Run the workflow
+        final_state = await self.workflow.ainvoke(initial_state)
+        
+        return {
+            'parsed_content': final_state['parsed_content'],
+            'cleaned_content': final_state['cleaned_content'],
+            'automation_analysis': final_state['automation_analysis'],
+            'improved_document': final_state['improved_document'],
+            'automation_commands': final_state.get('automation_commands', {}),
+            'generated_script': final_state['generated_script']
+        }
