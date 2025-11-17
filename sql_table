@@ -1,0 +1,9 @@
+CREATE TABLE IF NOT EXISTS automation_embeddings (
+    id SERIAL PRIMARY KEY,
+    automation_name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    steps TEXT NOT NULL,
+    combined_text TEXT NOT NULL,
+    embedding vector(1536),  -- Ada embeddings are 1536 dimensions
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
