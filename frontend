@@ -6,10 +6,7 @@ import tempfile
 from typing import Dict, Any
 import pandas as pd
 
-# Use the correct PDF viewer import
 from streamlit_pdf_viewer import pdf_viewer
-
-# Import your LangGraph workflow
 from document_automation_workflow import DocumentAutomationWorkflow
 
 st.set_page_config(
@@ -27,7 +24,7 @@ if 'workflow_results' not in st.session_state:
 if 'processing_complete' not in st.session_state:
     st.session_state.processing_complete = False
 
-# NEW: Input method selection
+# Input method selection
 st.markdown("### 📥 Choose Input Method")
 input_method = st.radio(
     "Select how you want to provide your document:",
@@ -50,14 +47,12 @@ if input_method == "Upload PDF File":
     )
     
     if uploaded_file is not None:
-        # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
             tmp_file.write(uploaded_file.getvalue())
             tmp_file_path = tmp_file.name
         
         st.success(f"✅ File uploaded: {uploaded_file.name}")
         
-        # Display PDF using streamlit-pdf-viewer
         st.markdown("**Document Preview:**")
         pdf_viewer(
             uploaded_file.getvalue(),
@@ -86,7 +81,6 @@ Example:
     )
     
     if text_input and len(text_input.strip()) > 50:
-        # Show word and character count
         word_count = len(text_input.split())
         char_count = len(text_input)
         
@@ -98,14 +92,12 @@ Example:
         with col3:
             st.metric("Lines", len(text_input.split('\n')))
         
-        # Create a temporary text file for processing
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".txt", encoding='utf-8') as tmp_file:
             tmp_file.write(text_input)
             tmp_file_path = tmp_file.name
         
         st.success(f"✅ Text content ready for analysis ({word_count} words)")
         
-        # Show preview
         with st.expander("📖 Preview Pasted Content", expanded=False):
             st.text_area(
                 "Content Preview",
@@ -117,22 +109,39 @@ Example:
     elif text_input:
         st.warning("⚠️ Please paste at least 50 characters of text for meaningful analysis")
 
-# Process button - shown only when input is provided
+# Process button
 if (input_method == "Upload PDF File" and uploaded_file is not None) or \
    (input_method == "Paste/Type Text" and text_input and len(text_input.strip()) > 50):
     
     if st.button("🚀 Analyze Document for Automation", type="primary", use_container_width=True):
         with st.spinner("Processing document through AI agents..."):
             try:
+                # Configuration (you should load these from config file)
+                db_config = {
+                    'dbname': 'automation_db',
+                    'user': 'postgres',
+                    'password': 'your_password',
+                    'host': 'localhost',
+                    'port': '5432'
+                }
+                
+                azure_embedding_config = {
+                    'api_key': 'your-azure-api-key',
+                    'api_version': '2023-05-15',
+                    'endpoint': 'https://your-resource.openai.azure.com/',
+                    'embedding_deployment': 'text-embedding-ada-002'
+                }
+                
                 # Initialize workflow
-                workflow = DocumentAutomationWorkflow()
+                workflow = DocumentAutomationWorkflow(
+                    db_config=db_config,
+                    azure_embedding_config=azure_embedding_config
+                )
                 
                 # Process based on input method
                 if input_method == "Upload PDF File":
-                    # Process PDF
                     results = asyncio.run(workflow.process_document(tmp_file_path))
                 else:
-                    # Process text input - use modified method
                     results = asyncio.run(workflow.process_text_document(tmp_file_path))
                 
                 st.session_state.workflow_results = results
@@ -143,15 +152,16 @@ if (input_method == "Upload PDF File" and uploaded_file is not None) or \
                 st.error(f"❌ Error processing document: {str(e)}")
                 st.exception(e)
 
-# Display results if available - 5 TABS
+# Display results - 6 TABS
 if st.session_state.workflow_results:
     results = st.session_state.workflow_results
     
-    # Create 5 tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    # Create 6 tabs
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📄 Raw Content", 
         "🧹 Cleaned Content", 
         "🎯 Automation Analysis",
+        "🔍 Similar Automations",
         "📈 Improved Document",
         "🤖 Script Generation"
     ])
@@ -159,11 +169,9 @@ if st.session_state.workflow_results:
     with tab1:
         st.subheader("Raw Extracted Content")
         
-        # Show processing summary for raw content
         if 'processing_summary' in results['parsed_content']:
             summary = results['parsed_content']['processing_summary']
             
-            # Different metrics based on input type
             if input_method == "Upload PDF File":
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
@@ -183,7 +191,6 @@ if st.session_state.workflow_results:
                 with col3:
                     st.metric("Processing Method", "Direct Text")
         
-        # Display raw combined content
         st.markdown("**Complete Raw Extracted Content:**")
         st.text_area(
             label="Raw Content Display",
@@ -194,7 +201,6 @@ if st.session_state.workflow_results:
             label_visibility="hidden"
         )
         
-        # Show page breakdown for PDF only
         if input_method == "Upload PDF File" and 'page_breakdown' in results['parsed_content']:
             st.markdown("**Page Processing Details:**")
             df_pages = pd.DataFrame(results['parsed_content']['page_breakdown'])
@@ -203,7 +209,6 @@ if st.session_state.workflow_results:
     with tab2:
         st.subheader("Cleaned & Processed Content")
         
-        # Show cleaning statistics
         if 'cleaning_stats' in results['cleaned_content']:
             stats = results['cleaned_content']['cleaning_stats']
             col1, col2, col3, col4 = st.columns(4)
@@ -216,7 +221,6 @@ if st.session_state.workflow_results:
             with col4:
                 st.metric("Sections Found", stats['sections_identified'])
         
-        # Show multimodal image analysis only for PDF uploads
         if input_method == "Upload PDF File" and 'image_analysis' in results['cleaned_content'] and results['cleaned_content']['image_analysis']:
             image_analyses = results['cleaned_content']['image_analysis']
             st.markdown("### 🖼️ Multimodal Image Analysis Results")
@@ -252,7 +256,6 @@ if st.session_state.workflow_results:
                     if i < len(image_analyses):
                         st.markdown("---")
         
-        # Show what was removed
         if 'removed_elements' in results['cleaned_content']:
             removed = results['cleaned_content']['removed_elements']
             st.markdown("**🧹 Content Cleaning Applied:**")
@@ -264,7 +267,6 @@ if st.session_state.workflow_results:
                 st.success("✅ OCR Noise Removed" if removed.get('ocr_noise') else "❌ OCR Noise")
                 st.success("✅ Repetitive Content Removed" if removed.get('repetitive_content') else "❌ Repetitive Content")
         
-        # Show cleaned text
         st.markdown("**📝 Cleaned Content (Ready for Analysis):**")
         cleaned_content = results['cleaned_content'].get('cleaned_text', 'No cleaned content available')
         
@@ -277,13 +279,11 @@ if st.session_state.workflow_results:
             label_visibility="hidden"
         )
         
-        # Show complete key sections without truncation
         if 'structured_content' in results['cleaned_content']:
             structured = results['cleaned_content']['structured_content']
             
             st.markdown("**🔍 Complete Key Sections Identified for Automation:**")
             
-            # Process Descriptions
             if structured.get('sections', {}).get('process_descriptions'):
                 st.markdown("**🔄 Process Descriptions (Complete):**")
                 process_descriptions = structured['sections']['process_descriptions']
@@ -295,7 +295,6 @@ if st.session_state.workflow_results:
                         if i < len(process_descriptions):
                             st.markdown("---")
             
-            # Task Instructions
             if structured.get('sections', {}).get('task_instructions'):
                 st.markdown("**📋 Task Instructions (Complete):**")
                 task_instructions = structured['sections']['task_instructions']
@@ -307,31 +306,6 @@ if st.session_state.workflow_results:
                         if i < len(task_instructions):
                             st.markdown("---")
             
-            # Data Definitions
-            if structured.get('sections', {}).get('data_definitions'):
-                st.markdown("**📊 Data Definitions (Complete):**")
-                data_definitions = structured['sections']['data_definitions']
-                st.info(f"Found {len(data_definitions)} data definitions")
-                
-                with st.expander(f"📊 View All {len(data_definitions)} Data Definitions", expanded=True):
-                    for i, data in enumerate(data_definitions, 1):
-                        st.markdown(f"**{i}.** {data}")
-                        if i < len(data_definitions):
-                            st.markdown("---")
-            
-            # Decision Rules
-            if structured.get('sections', {}).get('decision_rules'):
-                st.markdown("**🤔 Decision Rules (Complete):**")
-                decision_rules = structured['sections']['decision_rules']
-                st.info(f"Found {len(decision_rules)} decision rules")
-                
-                with st.expander(f"🤔 View All {len(decision_rules)} Decision Rules", expanded=True):
-                    for i, rule in enumerate(decision_rules, 1):
-                        st.markdown(f"**{i}.** {rule}")
-                        if i < len(decision_rules):
-                            st.markdown("---")
-            
-            # AI-Generated Key Automation Phrases
             if structured.get('key_phrases'):
                 st.markdown("**🔑 AI-Extracted Key Automation Phrases:**")
                 phrases = ", ".join([f"`{phrase}`" for phrase in structured['key_phrases']])
@@ -343,7 +317,6 @@ if st.session_state.workflow_results:
         
         analysis = results['automation_analysis']
         
-        # 5-Metric Dashboard
         st.markdown("### 📊 Automation Readiness Scores")
         
         col1, col2, col3, col4, col5 = st.columns(5)
@@ -372,11 +345,9 @@ if st.session_state.workflow_results:
             st.metric("👁️ Observability", f"{observability_score}/10",
                      help="Can execution be monitored and debugged?")
         
-        # Overall Score
         overall_score = analysis.get('overall_automation_score', 5.0)
         st.metric("🏆 **Overall Automation Score**", f"{overall_score}/10", f"{overall_score*10}%")
         
-        # Detailed Analysis Sections
         col1, col2 = st.columns(2)
         
         with col1:
@@ -409,6 +380,116 @@ if st.session_state.workflow_results:
                     st.success(f"✅ {win}")
     
     with tab4:
+        st.subheader("🔍 Similar Existing Automations")
+        
+        if 'similarity_matches' in results and results['similarity_matches']:
+            similarity_data = results['similarity_matches']
+            
+            # Check for errors
+            if 'error' in similarity_data:
+                st.warning(f"⚠️ Similarity matching unavailable: {similarity_data['error']}")
+                st.info("💡 Make sure the database is set up and embeddings are initialized")
+            else:
+                st.markdown("### 📝 Document Summary")
+                st.info(similarity_data.get('document_summary', 'No summary available'))
+                
+                similar_automations = similarity_data.get('similar_automations', [])
+                
+                if similar_automations:
+                    st.markdown(f"### 🎯 Top {len(similar_automations)} Similar Automations")
+                    st.success(f"Found {similarity_data.get('total_matches_found', 0)} matching automations in the database")
+                    
+                    for i, automation in enumerate(similar_automations, 1):
+                        similarity_pct = automation.get('similarity_percentage', 0)
+                        
+                        if similarity_pct >= 80:
+                            color = "🟢"
+                            badge_color = "success"
+                        elif similarity_pct >= 60:
+                            color = "🟡"
+                            badge_color = "warning"
+                        else:
+                            color = "🟠"
+                            badge_color = "error"
+                        
+                        with st.expander(
+                            f"{color} **#{i}: {automation.get('automation_name', 'Unknown')}** - {similarity_pct}% Similar",
+                            expanded=(i == 1)
+                        ):
+                            col1, col2 = st.columns([3, 1])
+                            with col1:
+                                st.markdown(f"**Automation Name:** {automation.get('automation_name', 'N/A')}")
+                            with col2:
+                                if badge_color == "success":
+                                    st.success(f"✅ {similarity_pct}%")
+                                elif badge_color == "warning":
+                                    st.warning(f"⚠️ {similarity_pct}%")
+                                else:
+                                    st.error(f"📊 {similarity_pct}%")
+                            
+                            st.markdown("**📋 Description:**")
+                            st.write(automation.get('description', 'No description available'))
+                            
+                            st.markdown("**🔄 Automation Steps:**")
+                            steps_text = automation.get('steps', 'No steps available')
+                            st.text_area(
+                                "Steps",
+                                value=steps_text,
+                                height=200,
+                                disabled=True,
+                                key=f"steps_{i}",
+                                label_visibility="collapsed"
+                            )
+                            
+                            st.markdown("**💡 Similarity Interpretation:**")
+                            if similarity_pct >= 80:
+                                st.success("Very High Similarity - This existing automation is very similar to your document")
+                            elif similarity_pct >= 60:
+                                st.warning("Moderate Similarity - This automation shares some characteristics with your document")
+                            else:
+                                st.info("Low Similarity - This automation has some related elements but significant differences")
+                    
+                    st.markdown("### 📥 Export Results")
+                    
+                    report_content = f"""# Similar Automations Report
+
+## Document Summary
+{similarity_data.get('document_summary', 'N/A')}
+
+## Top {len(similar_automations)} Similar Automations
+
+"""
+                    
+                    for i, automation in enumerate(similar_automations, 1):
+                        report_content += f"""
+### {i}. {automation.get('automation_name', 'Unknown')} ({automation.get('similarity_percentage', 0)}% Similar)
+
+**Description:**
+{automation.get('description', 'N/A')}
+
+**Steps:**
+{automation.get('steps', 'N/A')}
+
+---
+
+"""
+                    
+                    st.download_button(
+                        label="📄 Download Similarity Report",
+                        data=report_content,
+                        file_name="similar_automations_report.md",
+                        mime="text/markdown",
+                        help="Download detailed report of similar automations"
+                    )
+                
+                else:
+                    st.warning("⚠️ No similar automations found in the database")
+                    st.info("💡 This might mean your automation is unique or the database needs more entries")
+        
+        else:
+            st.error("❌ Similarity matching data not available")
+    
+    with tab5:
         st.subheader("📈 AI-Improved Document")
         
         if 'improved_document' in results:
@@ -445,10 +526,9 @@ if st.session_state.workflow_results:
                     mime="text/markdown"
                 )
     
-    with tab5:
+    with tab6:
         st.subheader("🤖 Automation Script Generation")
         
-        # Show automation commands analysis if available
         if 'automation_commands' in results:
             automation_cmd = results['automation_commands']
             
@@ -512,7 +592,6 @@ if st.session_state.workflow_results:
                         st.markdown(f"**Alternative:** {ui_task['alternative_suggestion']}")
                     st.markdown("")
         
-        # Script Generation Results
         script_data = results['generated_script']
         
         if not script_data.get('automation_viable', True):
