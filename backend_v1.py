@@ -13,29 +13,121 @@ from psycopg2.extras import RealDictCursor
 from openai import AzureOpenAI
 
 # ----------------------
-# Utility: simple char-based chunking
+# Utility: Paragraph-based chunking with recursive fallback
 # ----------------------
 
-def chunk_text(text: str, chunk_size: int = 4000, overlap: int = 400) -> List[str]:
+def chunk_text_by_paragraphs(text: str, max_chunk_size: int = 4000, overlap_paragraphs: int = 1) -> List[str]:
     """
-    Chunk large text into overlapping pieces by characters.
-    Ensures full coverage of the document with overlap for context.
+    Chunk text based on paragraph boundaries (double newlines).
+    Falls back to sentence and word boundaries if paragraphs are too large.
+    Includes paragraph overlap for context preservation.
     """
-    text = text or ""
-    if len(text) <= chunk_size:
+    if not text or len(text) <= max_chunk_size:
         return [text] if text else []
-
+    
+    # Split by paragraphs first (double newline)
+    paragraphs = re.split(r'\n\s*\n', text)
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
+    
     chunks = []
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(start + chunk_size, n)
-        chunks.append(text[start:end])
-        if end == n:
-            break
-        start = max(0, end - overlap)
-        if start >= n:
-            break
+    current_chunk = []
+    current_length = 0
+    
+    for i, para in enumerate(paragraphs):
+        para_length = len(para)
+        
+        # If single paragraph exceeds max_chunk_size, split it recursively
+        if para_length > max_chunk_size:
+            # If we have accumulated content, save it
+            if current_chunk:
+                chunks.append('\n\n'.join(current_chunk))
+                current_chunk = []
+                current_length = 0
+            
+            # Split large paragraph by sentences
+            sub_chunks = _split_large_paragraph(para, max_chunk_size)
+            chunks.extend(sub_chunks)
+            continue
+        
+        # Check if adding this paragraph exceeds max_chunk_size
+        if current_length + para_length + 2 > max_chunk_size and current_chunk:
+            # Save current chunk
+            chunks.append('\n\n'.join(current_chunk))
+            
+            # Start new chunk with overlap (last N paragraphs)
+            if overlap_paragraphs > 0 and len(current_chunk) > overlap_paragraphs:
+                current_chunk = current_chunk[-overlap_paragraphs:]
+                current_length = sum(len(p) for p in current_chunk) + (len(current_chunk) - 1) * 2
+            else:
+                current_chunk = []
+                current_length = 0
+        
+        # Add paragraph to current chunk
+        current_chunk.append(para)
+        current_length += para_length + 2  # +2 for '\n\n'
+    
+    # Add remaining chunk
+    if current_chunk:
+        chunks.append('\n\n'.join(current_chunk))
+    
+    return chunks
+
+
+def _split_large_paragraph(paragraph: str, max_size: int) -> List[str]:
+    """
+    Recursively split a large paragraph by sentences, then words if needed.
+    """
+    # Try splitting by sentences first
+    sentences = re.split(r'(?<=[.!?])\s+', paragraph)
+    
+    if len(sentences) == 1 or max(len(s) for s in sentences) > max_size:
+        # If single sentence or sentences are too large, split by words
+        return _split_by_words(paragraph, max_size)
+    
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for sentence in sentences:
+        sentence_length = len(sentence)
+        
+        if current_length + sentence_length + 1 > max_size and current_chunk:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = [sentence]
+            current_length = sentence_length
+        else:
+            current_chunk.append(sentence)
+            current_length += sentence_length + 1
+    
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
+    return chunks
+
+
+def _split_by_words(text: str, max_size: int) -> List[str]:
+    """
+    Last resort: split by words with max_size limit.
+    """
+    words = text.split()
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for word in words:
+        word_length = len(word)
+        
+        if current_length + word_length + 1 > max_size and current_chunk:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = [word]
+            current_length = word_length
+        else:
+            current_chunk.append(word)
+            current_length += word_length + 1
+    
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
     return chunks
 
 
@@ -299,7 +391,7 @@ class DocumentAutomationWorkflow:
             }
 
     # ----------------------
-    # AGENT 2: Cleaning (full doc via chunking)
+    # AGENT 2: Cleaning (paragraph-based chunking)
     # ----------------------
 
     async def _text_cleaning_agent(self, state: WorkflowState) -> WorkflowState:
@@ -344,8 +436,10 @@ class DocumentAutomationWorkflow:
         return text.strip()
 
     async def _ai_content_filtering(self, text: str) -> str:
-        chunks = chunk_text(text, chunk_size=4000, overlap=400)
+        """Uses paragraph-based chunking for content filtering."""
+        chunks = chunk_text_by_paragraphs(text, max_chunk_size=4000, overlap_paragraphs=1)
         cleaned_chunks = []
+        
         for i, chunk in enumerate(chunks):
             prompt = f"""
             You are cleaning a technical/automation document chunk.
@@ -362,6 +456,7 @@ class DocumentAutomationWorkflow:
             """
             resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
             cleaned_chunks.append((resp.content or "").strip())
+        
         return "\n\n".join(cleaned_chunks).strip()
 
     def _remove_headers_footers(self, text: str) -> str:
@@ -419,7 +514,8 @@ class DocumentAutomationWorkflow:
         }
 
     async def _extract_ai_key_phrases(self, text: str) -> List[str]:
-        chunks = chunk_text(text, chunk_size=3000, overlap=300)
+        """Uses paragraph-based chunking for key phrase extraction."""
+        chunks = chunk_text_by_paragraphs(text, max_chunk_size=3000, overlap_paragraphs=1)
         phrases: List[str] = []
 
         for i, chunk in enumerate(chunks):
@@ -454,7 +550,8 @@ class DocumentAutomationWorkflow:
     # ----------------------
 
     async def _ai_runbook_feature_extraction(self, text: str) -> Dict[str, Any]:
-        chunks = chunk_text(text, chunk_size=4000, overlap=400)
+        """Uses paragraph-based chunking for feature extraction."""
+        chunks = chunk_text_by_paragraphs(text, max_chunk_size=4000, overlap_paragraphs=1)
         aggregated = {
             "commands": [],
             "vague_terms": [],
@@ -556,7 +653,7 @@ class DocumentAutomationWorkflow:
         }
 
     # ----------------------
-    # AGENT 3: 5‑metric analysis (on FULL CLEANED TEXT)
+    # AGENT 3: 5‑metric analysis (on FULL CLEANED TEXT - NO SUMMARIZATION)
     # ----------------------
 
     async def _enhanced_automation_analysis_agent(self, state: WorkflowState) -> WorkflowState:
@@ -564,7 +661,8 @@ class DocumentAutomationWorkflow:
         cleaned_text = state['cleaned_content']['cleaned_text']
 
         rule_data = await self._extract_rule_data(cleaned_text)
-        scoring_analysis = await self._perform_five_metric_analysis(cleaned_text, rule_data)
+        # CHANGED: Score directly on full cleaned text without summarization
+        scoring_analysis = await self._perform_five_metric_analysis_on_full_content(cleaned_text, rule_data)
         improved_document = await self._generate_improved_actual_document(cleaned_text, scoring_analysis)
 
         comprehensive = {
@@ -579,97 +677,184 @@ class DocumentAutomationWorkflow:
         state['current_step'] = 'enhanced_analysis_complete'
         return state
 
-    async def _perform_five_metric_analysis(self, text: str, rule_data: Dict) -> Dict[str, Any]:
+    async def _perform_five_metric_analysis_on_full_content(self, text: str, rule_data: Dict) -> Dict[str, Any]:
         """
-        Score on 5 metrics using the FULL cleaned document via chunking.
+        Score on 5 metrics using the FULL cleaned document directly with paragraph-based chunking.
+        Each chunk is scored individually, then aggregated with weighted averaging.
         """
-
-        chunks = chunk_text(text, chunk_size=3500, overlap=400)
-        scoring_view_parts: List[str] = []
+        chunks = chunk_text_by_paragraphs(text, max_chunk_size=3500, overlap_paragraphs=1)
+        chunk_scores = []
+        
+        print(f"📊 Scoring {len(chunks)} paragraph-based chunks...")
+        
         for idx, chunk in enumerate(chunks):
-            prompt = f"""
-            Normalize this runbook/automation CHUNK into a dense representation
-            that preserves all details relevant to:
-            - clarity of steps
-            - determinism (input -> output)
-            - logic/decision structure
-            - automation feasibility
-            - observability and logging
+            chunk_length = len(chunk)
+            analysis_prompt = f"""
+            You are an expert runbook automation analyst. Analyze this CHUNK of the full document
+            and score it on 5 metrics (0–10). This is chunk {idx+1} of {len(chunks)}.
 
-            Do NOT summarize away important details. Rephrase only to remove redundancy,
-            keep all conditions, steps, and key signals.
+            RULE DATA (from full document):
+            - Total Commands Found: {rule_data['commands']['total_commands']}
+            - Vague Terms Found: {rule_data['quality_flags']['vague_terms']}
+            - Manual Decision Points: {rule_data['quality_flags']['manual_decisions']}
+            - UI Interactions: {rule_data['quality_flags']['ui_interactions']}
+            - Decision Points: {rule_data['logic_structure']['decision_points']}
 
-            Return 1–3 short paragraphs.
+            Score this chunk on:
+            1. **Clarity** (0-10): Are steps/instructions clear and unambiguous?
+            2. **Determinism** (0-10): Are inputs, outputs, and state transitions well-defined?
+            3. **Logic/Decision Structure** (0-10): Are conditionals and branching clear?
+            4. **Automation Feasibility** (0-10): Can this be automated (APIs, CLI, not just UI)?
+            5. **Observability** (0-10): Are there logging, monitoring, error-handling provisions?
+
+            Return JSON:
+            {{
+                "clarity_score": <number 0-10>,
+                "clarity_reasoning": "<brief explanation>",
+                "determinism_score": <number 0-10>,
+                "determinism_reasoning": "<brief explanation>",
+                "logic_decision_score": <number 0-10>,
+                "logic_decision_reasoning": "<brief explanation>",
+                "automation_feasibility_score": <number 0-10>,
+                "automation_feasibility_reasoning": "<brief explanation>",
+                "observability_score": <number 0-10>,
+                "observability_reasoning": "<brief explanation>",
+                "chunk_weight": {chunk_length}
+            }}
 
             CHUNK {idx+1}/{len(chunks)}:
             {chunk}
             """
-            resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
-            scoring_view_parts.append((resp.content or "").strip())
+            resp = await self.llm.ainvoke([HumanMessage(content=analysis_prompt)])
+            try:
+                chunk_analysis = json.loads(resp.content)
+                chunk_analysis['chunk_weight'] = chunk_length
+                chunk_scores.append(chunk_analysis)
+            except Exception as e:
+                print(f"⚠️ Error parsing chunk {idx+1} analysis: {e}")
+                # Default scores if parsing fails
+                chunk_scores.append({
+                    "clarity_score": 5,
+                    "clarity_reasoning": "Error in analysis",
+                    "determinism_score": 5,
+                    "determinism_reasoning": "Error in analysis",
+                    "logic_decision_score": 5,
+                    "logic_decision_reasoning": "Error in analysis",
+                    "automation_feasibility_score": 5,
+                    "automation_feasibility_reasoning": "Error in analysis",
+                    "observability_score": 5,
+                    "observability_reasoning": "Error in analysis",
+                    "chunk_weight": chunk_length
+                })
+        
+        # Aggregate scores using weighted average based on chunk length
+        total_weight = sum(c['chunk_weight'] for c in chunk_scores)
+        
+        def weighted_avg(metric: str) -> float:
+            return sum(c[metric] * c['chunk_weight'] for c in chunk_scores) / total_weight
+        
+        # Combine all reasoning
+        def combine_reasoning(metric: str) -> str:
+            reasonings = [f"Chunk {i+1}: {c[metric]}" for i, c in enumerate(chunk_scores)]
+            return " | ".join(reasonings[:5])  # Limit to first 5 to avoid token overflow
+        
+        # Generate overall recommendations based on all chunks
+        recommendations_prompt = f"""
+        Based on the analysis of {len(chunks)} chunks from a runbook document with these aggregate scores:
+        - Clarity: {weighted_avg('clarity_score'):.1f}/10
+        - Determinism: {weighted_avg('determinism_score'):.1f}/10
+        - Logic/Decision: {weighted_avg('logic_decision_score'):.1f}/10
+        - Automation Feasibility: {weighted_avg('automation_feasibility_score'):.1f}/10
+        - Observability: {weighted_avg('observability_score'):.1f}/10
 
-        scoring_view = "\n\n".join(scoring_view_parts)
-
-        analysis_prompt = f"""
-        You are an expert runbook automation analyst. Using the following
-        normalized representation of the FULL cleaned document, and the rule-data
-        extracted by another agent, score the runbook on 5 metrics (0–10).
-
-        RULE DATA:
-        - Total Commands Found: {rule_data['commands']['total_commands']}
-        - Vague Terms Found: {rule_data['quality_flags']['vague_terms']}
-        - Manual Decision Points: {rule_data['quality_flags']['manual_decisions']}
-        - UI Interactions: {rule_data['quality_flags']['ui_interactions']}
-        - Decision Points: {rule_data['logic_structure']['decision_points']}
-
-        Return your analysis as a JSON object with this exact structure:
-        {{
-            "clarity_score": <number 0-10>,
-            "clarity_reasoning": "<explanation>",
-            "determinism_score": <number 0-10>,
-            "determinism_reasoning": "<explanation>",
-            "logic_decision_score": <number 0-10>,
-            "logic_decision_reasoning": "<explanation>",
-            "automation_feasibility_score": <number 0-10>,
-            "automation_feasibility_reasoning": "<explanation>",
-            "observability_score": <number 0-10>,
-            "observability_reasoning": "<explanation>",
-            "improvement_recommendations": ["<rec1>", "<rec2>", "<rec3>"],
-            "critical_issues": ["<issue1>", "<issue2>"],
-            "quick_wins": ["<win1>", "<win2>"]
-        }}
-
-        FULL CLEANED DOCUMENT (normalized for scoring, but derived from all chunks):
-        {scoring_view}
-        """
-        resp = await self.llm.ainvoke([HumanMessage(content=analysis_prompt)])
-        return json.loads(resp.content)
-
-    async def _generate_improved_actual_document(self, original_text: str, analysis: Dict) -> Dict[str, Any]:
-        prompt = f"""
-        Improve this automation/runbook document to increase automation readiness.
-
-        Use these analysis scores:
-        - Clarity: {analysis.get('clarity_score', 5)}/10
-        - Determinism: {analysis.get('determinism_score', 5)}/10
-        - Feasibility: {analysis.get('automation_feasibility_score', 5)}/10
-
-        Fix vague terms, manual decisions where possible, and missing observability.
+        Provide:
+        1. Top 3-5 improvement recommendations
+        2. Critical issues that must be addressed
+        3. Quick wins for immediate improvement
 
         Return JSON:
         {{
-          "improved_content": "<full improved document>",
-          "improvements_made": ["<improvement1>", "<improvement2>"],
-          "automation_score_increase": <number>,
-          "new_clarity_score": <number>,
-          "new_determinism_score": <number>,
-          "new_automation_feasibility": <number>
+            "improvement_recommendations": ["rec1", "rec2", "rec3"],
+            "critical_issues": ["issue1", "issue2"],
+            "quick_wins": ["win1", "win2"]
         }}
-
-        ORIGINAL CLEANED DOCUMENT:
-        {original_text}
         """
-        resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
-        return json.loads(resp.content)
+        
+        rec_resp = await self.llm.ainvoke([HumanMessage(content=recommendations_prompt)])
+        try:
+            recommendations = json.loads(rec_resp.content)
+        except:
+            recommendations = {
+                "improvement_recommendations": ["Improve clarity of steps", "Add more deterministic inputs/outputs"],
+                "critical_issues": ["Missing error handling", "Too many manual steps"],
+                "quick_wins": ["Add logging statements", "Document API endpoints"]
+            }
+        
+        return {
+            "clarity_score": round(weighted_avg('clarity_score'), 1),
+            "clarity_reasoning": combine_reasoning('clarity_reasoning'),
+            "determinism_score": round(weighted_avg('determinism_score'), 1),
+            "determinism_reasoning": combine_reasoning('determinism_reasoning'),
+            "logic_decision_score": round(weighted_avg('logic_decision_score'), 1),
+            "logic_decision_reasoning": combine_reasoning('logic_decision_reasoning'),
+            "automation_feasibility_score": round(weighted_avg('automation_feasibility_score'), 1),
+            "automation_feasibility_reasoning": combine_reasoning('automation_feasibility_reasoning'),
+            "observability_score": round(weighted_avg('observability_score'), 1),
+            "observability_reasoning": combine_reasoning('observability_reasoning'),
+            "improvement_recommendations": recommendations.get('improvement_recommendations', []),
+            "critical_issues": recommendations.get('critical_issues', []),
+            "quick_wins": recommendations.get('quick_wins', []),
+            "chunks_analyzed": len(chunks),
+            "scoring_method": "paragraph_based_weighted_average"
+        }
+
+    async def _generate_improved_actual_document(self, original_text: str, analysis: Dict) -> Dict[str, Any]:
+        """Uses paragraph-based chunking for document improvement."""
+        chunks = chunk_text_by_paragraphs(original_text, max_chunk_size=3500, overlap_paragraphs=1)
+        improved_chunks = []
+        all_improvements = []
+        
+        for i, chunk in enumerate(chunks):
+            prompt = f"""
+            Improve this automation/runbook CHUNK to increase automation readiness.
+
+            Use these analysis scores:
+            - Clarity: {analysis.get('clarity_score', 5)}/10
+            - Determinism: {analysis.get('determinism_score', 5)}/10
+            - Feasibility: {analysis.get('automation_feasibility_score', 5)}/10
+
+            Fix vague terms, manual decisions where possible, and missing observability.
+
+            Return JSON:
+            {{
+              "improved_content": "<improved chunk>",
+              "improvements_made": ["<improvement1>", "<improvement2>"]
+            }}
+
+            CHUNK {i+1}/{len(chunks)}:
+            {chunk}
+            """
+            resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            try:
+                result = json.loads(resp.content)
+                improved_chunks.append(result.get('improved_content', chunk))
+                all_improvements.extend(result.get('improvements_made', []))
+            except:
+                improved_chunks.append(chunk)
+        
+        improved_content = "\n\n".join(improved_chunks)
+        
+        # Estimate score improvements
+        score_increase = min(2.0, (10 - analysis.get('automation_feasibility_score', 5)) * 0.3)
+        
+        return {
+            "improved_content": improved_content,
+            "improvements_made": list(set(all_improvements))[:10],  # Deduplicate and limit
+            "automation_score_increase": round(score_increase, 1),
+            "new_clarity_score": min(10, analysis.get('clarity_score', 5) + score_increase * 0.4),
+            "new_determinism_score": min(10, analysis.get('determinism_score', 5) + score_increase * 0.4),
+            "new_automation_feasibility": min(10, analysis.get('automation_feasibility_score', 5) + score_increase)
+        }
 
     def _calculate_overall_score(self, analysis: Dict) -> float:
         scores = [
@@ -686,8 +871,10 @@ class DocumentAutomationWorkflow:
     # ----------------------
 
     async def _generate_document_summary(self, cleaned_text: str, analysis: Dict) -> str:
-        chunks = chunk_text(cleaned_text, chunk_size=4000, overlap=400)
+        """Uses paragraph-based chunking for summary generation."""
+        chunks = chunk_text_by_paragraphs(cleaned_text, max_chunk_size=4000, overlap_paragraphs=1)
         partial_summaries: List[str] = []
+        
         for idx, chunk in enumerate(chunks):
             prompt = f"""
             Summarize this automation/runbook CHUNK for similarity search.
@@ -699,6 +886,7 @@ class DocumentAutomationWorkflow:
             """
             resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
             partial_summaries.append((resp.content or "").strip())
+        
         summary = "\n\n".join(partial_summaries)
         return summary
 
@@ -799,29 +987,46 @@ class DocumentAutomationWorkflow:
         return state
 
     async def _analyze_automation_commands(self, content: str, analysis: Dict) -> Dict[str, Any]:
-        prompt = f"""
-        Analyze the improved document content and suggest specific automation commands for each step.
+        """Uses paragraph-based chunking for command analysis."""
+        chunks = chunk_text_by_paragraphs(content, max_chunk_size=3500, overlap_paragraphs=1)
+        all_automatable_steps = []
+        all_ui_only_tasks = []
+        
+        for i, chunk in enumerate(chunks):
+            prompt = f"""
+            Analyze this CHUNK and suggest specific automation commands for each step.
 
-        Return JSON:
-        {{
-          "automatable_steps": [...],
-          "ui_only_tasks": [...],
-          "automation_summary": {{
-             "total_steps": ...,
-             "automatable_steps": ...,
-             "ui_only_steps": ...,
-             "automation_percentage": ...,
-             "complexity_level": "High/Medium/Low"
-          }}
-        }}
+            Return JSON:
+            {{
+              "automatable_steps": [...],
+              "ui_only_tasks": [...]
+            }}
 
-        OVERALL AUTOMATION SCORE: {analysis.get('overall_automation_score', 6)}/10
-
-        IMPROVED DOCUMENT:
-        {content}
-        """
-        resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
-        return json.loads(resp.content)
+            CHUNK {i+1}/{len(chunks)}:
+            {chunk}
+            """
+            resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            try:
+                result = json.loads(resp.content)
+                all_automatable_steps.extend(result.get('automatable_steps', []))
+                all_ui_only_tasks.extend(result.get('ui_only_tasks', []))
+            except:
+                pass
+        
+        total_steps = len(all_automatable_steps) + len(all_ui_only_tasks)
+        automation_pct = round((len(all_automatable_steps) / total_steps * 100), 2) if total_steps > 0 else 0
+        
+        return {
+            "automatable_steps": all_automatable_steps,
+            "ui_only_tasks": all_ui_only_tasks,
+            "automation_summary": {
+                "total_steps": total_steps,
+                "automatable_steps": len(all_automatable_steps),
+                "ui_only_steps": len(all_ui_only_tasks),
+                "automation_percentage": automation_pct,
+                "complexity_level": "High" if automation_pct < 40 else "Medium" if automation_pct < 70 else "Low"
+            }
+        }
 
     # ----------------------
     # AGENT 6: Script generation
@@ -848,8 +1053,9 @@ class DocumentAutomationWorkflow:
         explanation += f"- Automation Percentage: {percentage}%\n"
         explanation += "- Threshold Required: 30% minimum\n\n"
         explanation += "## Reasons for Low Automation Score:\n\n"
-        for i, t in enumerate(ui_tasks, 1):
-            explanation += f"{i}. {t.get('step_description', 'UI Task')}\n"
+        for i, t in enumerate(ui_tasks[:10], 1):  # Limit to 10
+            task_desc = t if isinstance(t, str) else t.get('step_description', 'UI Task')
+            explanation += f"{i}. {task_desc}\n"
         return {
             'script_type': 'Analysis Report',
             'automation_viable': False,
@@ -888,7 +1094,20 @@ class DocumentAutomationWorkflow:
         OVERALL AUTOMATION SCORE: {analysis.get('overall_automation_score', 6)}/10
         """
         resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
-        data = json.loads(resp.content)
+        try:
+            data = json.loads(resp.content)
+        except:
+            data = {
+                "code": "# Error generating script",
+                "requirements": [],
+                "execution_steps": [],
+                "parameters_required": [],
+                "script_description": "Error in generation",
+                "automation_coverage": "Unknown",
+                "manual_steps_remaining": [],
+                "notes": "Failed to generate script"
+            }
+        
         data.update({
             'script_type': 'Python Automation Script',
             'automation_viable': True,
