@@ -306,11 +306,8 @@ class DocumentAutomationWorkflow:
         print("🧹 Text Cleaning Agent...")
         raw_text = state['parsed_content']['combined_text']
 
-        # basic structural cleanup (no truncation)
         cleaned_text_basic = self._basic_text_cleaning(raw_text)
-        # AI filtering over ALL text via chunking
         filtered_text = await self._ai_content_filtering(cleaned_text_basic)
-        # remove repeated headers/footers etc.
         final_text = self._remove_headers_footers(filtered_text)
         structured_content = await self._extract_key_sections(final_text)
 
@@ -387,7 +384,7 @@ class DocumentAutomationWorkflow:
         return "\n".join(filtered)
 
     # ----------------------
-    # AI extraction of sections and key phrases (full doc via chunking)
+    # AI extraction of sections and key phrases
     # ----------------------
 
     async def _extract_key_sections(self, text: str) -> Dict[str, Any]:
@@ -453,7 +450,7 @@ class DocumentAutomationWorkflow:
         return out[:30]
 
     # ----------------------
-    # AI-based feature extraction (no regex)
+    # AI-based feature extraction (commands, vague terms, etc.)
     # ----------------------
 
     async def _ai_runbook_feature_extraction(self, text: str) -> Dict[str, Any]:
@@ -585,16 +582,9 @@ class DocumentAutomationWorkflow:
     async def _perform_five_metric_analysis(self, text: str, rule_data: Dict) -> Dict[str, Any]:
         """
         Score on 5 metrics using the FULL cleaned document via chunking.
-        The model sees the entire cleaned doc, chunk by chunk.
         """
 
         chunks = chunk_text(text, chunk_size=3500, overlap=400)
-        # we give scoring context + a separate scoring instruction
-        # but we keep the scoring JSON in one final call.
-        # To respect context, we first condense all chunks into a "scoring view"
-        # but *still derived from the whole cleaned text*.
-
-        # Build a rich "scoring view" by concatenating LLM-normalized chunks
         scoring_view_parts: List[str] = []
         for idx, chunk in enumerate(chunks):
             prompt = f"""
@@ -692,7 +682,7 @@ class DocumentAutomationWorkflow:
         return round(sum(scores) / len(scores), 1)
 
     # ----------------------
-    # AGENT 4: Similarity matching (unchanged, but uses full doc summary)
+    # AGENT 4: Similarity matching
     # ----------------------
 
     async def _generate_document_summary(self, cleaned_text: str, analysis: Dict) -> str:
@@ -794,7 +784,7 @@ class DocumentAutomationWorkflow:
         return state
 
     # ----------------------
-    # AGENT 5: Automation commands (unchanged logic)
+    # AGENT 5: Automation commands
     # ----------------------
 
     async def _automation_commands_agent(self, state: WorkflowState) -> WorkflowState:
@@ -834,7 +824,7 @@ class DocumentAutomationWorkflow:
         return json.loads(resp.content)
 
     # ----------------------
-    # AGENT 6: Script generation (unchanged logic)
+    # AGENT 6: Script generation
     # ----------------------
 
     async def _script_generation_agent(self, state: WorkflowState) -> WorkflowState:
