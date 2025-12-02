@@ -210,7 +210,7 @@ class DocumentAutomationWorkflow:
         return workflow.compile()
 
     # ----------------------
-    # AGENT 1: PDF parsing (IMAGE PROCESSING UNCHANGED)
+    # AGENT 1: PDF parsing (IMAGE PROCESSING - PRESERVED IN COMBINED TEXT)
     # ----------------------
 
     async def _parse_document_agent(self, state: WorkflowState) -> WorkflowState:
@@ -228,6 +228,7 @@ class DocumentAutomationWorkflow:
         return state
 
     async def _extract_content_by_page(self, pdf_path: str) -> Dict[str, Any]:
+        """Image analysis is embedded directly into combined_text"""
         combined_text = ""
         page_details = []
         image_analysis = []
@@ -255,7 +256,7 @@ class DocumentAutomationWorkflow:
                                 img_data, page_num + 1, img_index + 1
                             )
 
-                            image_block = f"\n[IMAGE_{img_index + 1}_ANALYSIS]:\n"
+                            image_block = f"\n\n[IMAGE_{img_index + 1}_ANALYSIS]:\n"
                             image_block += f"Description: {multimodal_result['description']}\n"
                             image_block += f"Purpose: {multimodal_result['purpose']}\n"
                             image_block += f"Automation Relevance: {multimodal_result['automation_relevance']}\n"
@@ -263,7 +264,7 @@ class DocumentAutomationWorkflow:
                                 image_block += f"Extracted Text: {multimodal_result['extracted_text']}\n"
                             else:
                                 image_block += "Extracted Text: No text detected in image\n"
-                            image_block += f"[END_IMAGE_{img_index + 1}_ANALYSIS]\n"
+                            image_block += f"[END_IMAGE_{img_index + 1}_ANALYSIS]\n\n"
 
                             page_multimodal_content += image_block
                             page_image_analysis.append({
@@ -280,10 +281,10 @@ class DocumentAutomationWorkflow:
 
             page_combined = f"\n--- PAGE {page_num + 1} ---\n"
             page_combined += page_text_content
-            if image_list:
-                page_combined += f"\n--- IMAGES ANALYSIS FOR PAGE {page_num + 1} ---\n"
-                page_combined += page_multimodal_content
-                page_combined += f"--- END IMAGES ANALYSIS FOR PAGE {page_num + 1} ---\n"
+            
+            if page_multimodal_content:
+                page_combined += "\n" + page_multimodal_content
+            
             page_combined += f"\n--- END PAGE {page_num + 1} ---\n\n"
 
             combined_text += page_combined
@@ -326,7 +327,7 @@ class DocumentAutomationWorkflow:
         return text_content
 
     async def _perform_multimodal_analysis(self, image_data: bytes, page_num: int, img_num: int) -> Dict[str, str]:
-        """Multimodal image analysis - UNCHANGED"""
+        """Multimodal image analysis"""
         try:
             img_base64 = base64.b64encode(image_data).decode('utf-8')
             multimodal_prompt = f"""
@@ -392,7 +393,7 @@ class DocumentAutomationWorkflow:
             }
 
     # ----------------------
-    # AGENT 2: Cleaning (FIXED - paragraph-based chunking)
+    # AGENT 2: Cleaning
     # ----------------------
 
     async def _text_cleaning_agent(self, state: WorkflowState) -> WorkflowState:
@@ -430,6 +431,7 @@ class DocumentAutomationWorkflow:
         return state
 
     def _basic_text_cleaning(self, text: str) -> str:
+        """Don't remove IMAGE_ANALYSIS blocks"""
         text = re.sub(r'--- PAGE \d+ ---', '', text)
         text = re.sub(r'--- END PAGE \d+ ---', '', text)
         text = re.sub(r'\n\s*\n\s*\n', '\n\n', text)
@@ -437,24 +439,25 @@ class DocumentAutomationWorkflow:
         return text.strip()
 
     async def _ai_content_filtering(self, text: str) -> str:
-        """FIXED: Uses paragraph-based chunking for content filtering."""
+        """Uses paragraph-based chunking AND preserves IMAGE_ANALYSIS blocks"""
         chunks = chunk_text_by_paragraphs(text, max_chunk_size=4000, overlap_paragraphs=1)
         cleaned_chunks = []
         
-        print(f"🧹 Cleaning {len(chunks)} paragraph-based chunks...")
+        print(f"🧹 Cleaning {len(chunks)} sections...")
         
         for i, chunk in enumerate(chunks):
             prompt = f"""
-            You are cleaning a technical/automation document chunk.
+            You are cleaning a technical/automation document.
 
             Tasks:
             - Remove headers, footers, boilerplate, page numbers and OCR noise.
+            - **IMPORTANT: Keep ALL [IMAGE_X_ANALYSIS] blocks exactly as they are - these contain critical multimodal analysis.**
             - Keep all process descriptions, steps, workflows, data definitions, business rules, commands, and image-analysis blocks.
             - Preserve order and technical detail. Do NOT summarize.
 
-            Return ONLY the cleaned text for this chunk.
+            Return ONLY the cleaned text.
 
-            CHUNK {i+1}/{len(chunks)}:
+            DOCUMENT SECTION:
             {chunk}
             """
             resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
@@ -463,12 +466,16 @@ class DocumentAutomationWorkflow:
         return "\n\n".join(cleaned_chunks).strip()
 
     def _remove_headers_footers(self, text: str) -> str:
+        """Protect IMAGE_ANALYSIS blocks from removal"""
         lines = text.split("\n")
         if len(lines) < 10:
             return text
 
         line_counts: Dict[str, int] = {}
         for line in lines:
+            if '[IMAGE_' in line or '[END_IMAGE_' in line:
+                continue
+            
             clean = re.sub(r'\d+', 'NUM', line.strip())
             if 5 < len(clean) < 80:
                 line_counts[clean] = line_counts.get(clean, 0) + 1
@@ -476,13 +483,17 @@ class DocumentAutomationWorkflow:
         repetitive = {ln for ln, c in line_counts.items() if c >= 3}
         filtered = []
         for line in lines:
+            if '[IMAGE_' in line or '[END_IMAGE_' in line or 'Description:' in line or 'Purpose:' in line or 'Automation Relevance:' in line or 'Extracted Text:' in line:
+                filtered.append(line)
+                continue
+            
             clean = re.sub(r'\d+', 'NUM', line.strip())
             if clean not in repetitive:
                 filtered.append(line)
         return "\n".join(filtered)
 
     # ----------------------
-    # AI extraction of sections and key phrases (FIXED)
+    # AI extraction of sections and key phrases
     # ----------------------
 
     async def _extract_key_sections(self, text: str) -> Dict[str, Any]:
@@ -517,19 +528,17 @@ class DocumentAutomationWorkflow:
         }
 
     async def _extract_ai_key_phrases(self, text: str) -> List[str]:
-        """FIXED: Uses paragraph-based chunking for key phrase extraction."""
         chunks = chunk_text_by_paragraphs(text, max_chunk_size=3000, overlap_paragraphs=1)
         phrases: List[str] = []
 
         for i, chunk in enumerate(chunks):
             prompt = f"""
-            From this automation/runbook CHUNK, extract 5–10 key phrases that are
+            From this automation/runbook document, extract 5–10 key phrases that are
             most important for automation (technical terms, process names, tools,
-            commands, systems, workflows, automation concepts).
+            commands, systems, workflows, automation concepts, visual elements from images).
 
             Return ONLY a comma-separated list of phrases.
 
-            CHUNK {i+1}/{len(chunks)}:
             {chunk}
             """
             resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
@@ -549,11 +558,10 @@ class DocumentAutomationWorkflow:
         return out[:30]
 
     # ----------------------
-    # AI-based feature extraction (FIXED)
+    # AI-based feature extraction
     # ----------------------
 
     async def _ai_runbook_feature_extraction(self, text: str) -> Dict[str, Any]:
-        """FIXED: Uses paragraph-based chunking for feature extraction."""
         chunks = chunk_text_by_paragraphs(text, max_chunk_size=4000, overlap_paragraphs=1)
         aggregated = {
             "commands": [],
@@ -563,17 +571,17 @@ class DocumentAutomationWorkflow:
             "decision_points": []
         }
 
-        print(f"🔍 Extracting features from {len(chunks)} paragraph-based chunks...")
+        print(f"🔍 Extracting features from document...")
 
         for idx, chunk in enumerate(chunks):
             prompt = f"""
-            Analyze this automation/runbook CHUNK and extract the following items using
+            Analyze this automation/runbook document section and extract the following items using
             exact phrases from the text:
 
             - "commands": shell/CLI/API/SQL/script commands or imperative instructions.
             - "vague_terms": unclear/non-testable phrases (like "verify system is ok", "make sure it's fine").
             - "manual_decisions": phrases indicating human judgment/approval/review/decision.
-            - "ui_interactions": phrases describing GUI/dashboard/web UI actions.
+            - "ui_interactions": phrases describing GUI/dashboard/web UI actions (including from images).
             - "decision_points": conditional/branching phrases (if/when/unless/depending on, etc.).
 
             Return JSON ONLY with this exact structure:
@@ -586,9 +594,8 @@ class DocumentAutomationWorkflow:
               "decision_points": ["..."]
             }}
 
-            Do NOT summarize or explain, just lists of exact phrases from this chunk.
+            Do NOT summarize or explain, just lists of exact phrases.
 
-            CHUNK {idx+1}/{len(chunks)}:
             {chunk}
             """
             resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
@@ -658,7 +665,7 @@ class DocumentAutomationWorkflow:
         }
 
     # ----------------------
-    # AGENT 3: 5‑metric analysis (FIXED - direct scoring on full content)
+    # AGENT 3: 5‑metric analysis (FIXED - User-friendly reasoning)
     # ----------------------
 
     async def _enhanced_automation_analysis_agent(self, state: WorkflowState) -> WorkflowState:
@@ -666,7 +673,6 @@ class DocumentAutomationWorkflow:
         cleaned_text = state['cleaned_content']['cleaned_text']
 
         rule_data = await self._extract_rule_data(cleaned_text)
-        # FIXED: Score directly on full cleaned text without summarization
         scoring_analysis = await self._perform_five_metric_analysis_on_full_content(cleaned_text, rule_data)
         improved_document = await self._generate_improved_actual_document(cleaned_text, scoring_analysis)
 
@@ -684,19 +690,21 @@ class DocumentAutomationWorkflow:
 
     async def _perform_five_metric_analysis_on_full_content(self, text: str, rule_data: Dict) -> Dict[str, Any]:
         """
-        FIXED: Score on 5 metrics using the FULL cleaned document directly with paragraph-based chunking.
-        Each chunk is scored individually on actual content (NO SUMMARIZATION), then aggregated with weighted averaging.
+        FIXED: Score on 5 metrics with user-friendly reasoning (no mention of chunks)
         """
         chunks = chunk_text_by_paragraphs(text, max_chunk_size=3500, overlap_paragraphs=1)
         chunk_scores = []
         
-        print(f"📊 Scoring {len(chunks)} paragraph-based chunks directly on content...")
+        print(f"📊 Analyzing document comprehensively...")
         
         for idx, chunk in enumerate(chunks):
             chunk_length = len(chunk)
             analysis_prompt = f"""
-            You are an expert runbook automation analyst. Analyze this CHUNK of the full document
-            and score it on 5 metrics (0–10). This is chunk {idx+1} of {len(chunks)}.
+            You are an expert runbook automation analyst. Analyze this section of a document
+            and score it on 5 metrics (0–10).
+
+            **IMPORTANT: In your reasoning, analyze the content naturally without mentioning "chunk", "section number", or "part X". 
+            Refer to specific content elements like "the deployment procedure", "the error handling steps", "the monitoring configuration", etc.**
 
             RULE DATA (from full document):
             - Total Commands Found: {rule_data['commands']['total_commands']}
@@ -705,29 +713,29 @@ class DocumentAutomationWorkflow:
             - UI Interactions: {rule_data['quality_flags']['ui_interactions']}
             - Decision Points: {rule_data['logic_structure']['decision_points']}
 
-            Score this chunk on:
+            Score on:
             1. **Clarity** (0-10): Are steps/instructions clear and unambiguous?
             2. **Determinism** (0-10): Are inputs, outputs, and state transitions well-defined?
             3. **Logic/Decision Structure** (0-10): Are conditionals and branching clear?
             4. **Automation Feasibility** (0-10): Can this be automated (APIs, CLI, not just UI)?
             5. **Observability** (0-10): Are there logging, monitoring, error-handling provisions?
 
-            Return JSON:
+            Return JSON with natural, document-focused reasoning:
             {{
                 "clarity_score": <number 0-10>,
-                "clarity_reasoning": "<brief explanation>",
+                "clarity_reasoning": "<explanation about the document's clarity>",
                 "determinism_score": <number 0-10>,
-                "determinism_reasoning": "<brief explanation>",
+                "determinism_reasoning": "<explanation about the document's determinism>",
                 "logic_decision_score": <number 0-10>,
-                "logic_decision_reasoning": "<brief explanation>",
+                "logic_decision_reasoning": "<explanation about the document's logic>",
                 "automation_feasibility_score": <number 0-10>,
-                "automation_feasibility_reasoning": "<brief explanation>",
+                "automation_feasibility_reasoning": "<explanation about automation potential>",
                 "observability_score": <number 0-10>,
-                "observability_reasoning": "<brief explanation>",
+                "observability_reasoning": "<explanation about observability>",
                 "chunk_weight": {chunk_length}
             }}
 
-            ACTUAL CHUNK CONTENT (analyze this directly, do NOT summarize):
+            DOCUMENT CONTENT:
             {chunk}
             """
             resp = await self.llm.ainvoke([HumanMessage(content=analysis_prompt)])
@@ -736,8 +744,7 @@ class DocumentAutomationWorkflow:
                 chunk_analysis['chunk_weight'] = chunk_length
                 chunk_scores.append(chunk_analysis)
             except Exception as e:
-                print(f"⚠️ Error parsing chunk {idx+1} analysis: {e}")
-                # Default scores if parsing fails
+                print(f"⚠️ Error in analysis: {e}")
                 chunk_scores.append({
                     "clarity_score": 5,
                     "clarity_reasoning": "Error in analysis",
@@ -752,20 +759,36 @@ class DocumentAutomationWorkflow:
                     "chunk_weight": chunk_length
                 })
         
-        # Aggregate scores using weighted average based on chunk length
+        # Aggregate scores
         total_weight = sum(c['chunk_weight'] for c in chunk_scores)
         
         def weighted_avg(metric: str) -> float:
             return sum(c[metric] * c['chunk_weight'] for c in chunk_scores) / total_weight
         
-        # Combine all reasoning
-        def combine_reasoning(metric: str) -> str:
-            reasonings = [f"Chunk {i+1}: {c[metric]}" for i, c in enumerate(chunk_scores)]
-            return " | ".join(reasonings[:5])  # Limit to first 5 to avoid token overflow
+        # FIXED: Synthesize reasoning into cohesive document-level analysis
+        def synthesize_reasoning(metric: str) -> str:
+            """Combine multiple reasoning fragments into unified document-level reasoning"""
+            all_reasonings = [c[metric] for c in chunk_scores if c[metric] != "Error in analysis"]
+            
+            if not all_reasonings:
+                return "Analysis could not be completed."
+            
+            # If only one reasoning, return it
+            if len(all_reasonings) == 1:
+                return all_reasonings[0]
+            
+            # Combine multiple reasonings into coherent summary
+            combined = " ".join(all_reasonings)
+            # Remove chunk references if they somehow slipped through
+            combined = re.sub(r'Chunk \d+:', '', combined)
+            combined = re.sub(r'Section \d+:', '', combined)
+            combined = re.sub(r'Part \d+:', '', combined)
+            
+            return combined[:500]  # Limit length
         
-        # Generate overall recommendations based on all chunks
+        # Generate recommendations
         recommendations_prompt = f"""
-        Based on the analysis of {len(chunks)} chunks from a runbook document with these aggregate scores:
+        Based on a comprehensive analysis of a runbook document with these scores:
         - Clarity: {weighted_avg('clarity_score'):.1f}/10
         - Determinism: {weighted_avg('determinism_score'):.1f}/10
         - Logic/Decision: {weighted_avg('logic_decision_score'):.1f}/10
@@ -797,33 +820,31 @@ class DocumentAutomationWorkflow:
         
         return {
             "clarity_score": round(weighted_avg('clarity_score'), 1),
-            "clarity_reasoning": combine_reasoning('clarity_reasoning'),
+            "clarity_reasoning": synthesize_reasoning('clarity_reasoning'),
             "determinism_score": round(weighted_avg('determinism_score'), 1),
-            "determinism_reasoning": combine_reasoning('determinism_reasoning'),
+            "determinism_reasoning": synthesize_reasoning('determinism_reasoning'),
             "logic_decision_score": round(weighted_avg('logic_decision_score'), 1),
-            "logic_decision_reasoning": combine_reasoning('logic_decision_reasoning'),
+            "logic_decision_reasoning": synthesize_reasoning('logic_decision_reasoning'),
             "automation_feasibility_score": round(weighted_avg('automation_feasibility_score'), 1),
-            "automation_feasibility_reasoning": combine_reasoning('automation_feasibility_reasoning'),
+            "automation_feasibility_reasoning": synthesize_reasoning('automation_feasibility_reasoning'),
             "observability_score": round(weighted_avg('observability_score'), 1),
-            "observability_reasoning": combine_reasoning('observability_reasoning'),
+            "observability_reasoning": synthesize_reasoning('observability_reasoning'),
             "improvement_recommendations": recommendations.get('improvement_recommendations', []),
             "critical_issues": recommendations.get('critical_issues', []),
             "quick_wins": recommendations.get('quick_wins', []),
-            "chunks_analyzed": len(chunks),
-            "scoring_method": "paragraph_based_weighted_average"
+            "scoring_method": "comprehensive_document_analysis"
         }
 
     async def _generate_improved_actual_document(self, original_text: str, analysis: Dict) -> Dict[str, Any]:
-        """FIXED: Uses paragraph-based chunking for document improvement."""
         chunks = chunk_text_by_paragraphs(original_text, max_chunk_size=3500, overlap_paragraphs=1)
         improved_chunks = []
         all_improvements = []
         
-        print(f"✨ Improving {len(chunks)} paragraph-based chunks...")
+        print(f"✨ Improving document...")
         
         for i, chunk in enumerate(chunks):
             prompt = f"""
-            Improve this automation/runbook CHUNK to increase automation readiness.
+            Improve this section of an automation/runbook document to increase automation readiness.
 
             Use these analysis scores:
             - Clarity: {analysis.get('clarity_score', 5)}/10
@@ -831,14 +852,14 @@ class DocumentAutomationWorkflow:
             - Feasibility: {analysis.get('automation_feasibility_score', 5)}/10
 
             Fix vague terms, manual decisions where possible, and missing observability.
+            **IMPORTANT: Keep [IMAGE_X_ANALYSIS] blocks intact - do not modify them.**
 
             Return JSON:
             {{
-              "improved_content": "<improved chunk>",
+              "improved_content": "<improved content>",
               "improvements_made": ["<improvement1>", "<improvement2>"]
             }}
 
-            CHUNK {i+1}/{len(chunks)}:
             {chunk}
             """
             resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
@@ -851,12 +872,11 @@ class DocumentAutomationWorkflow:
         
         improved_content = "\n\n".join(improved_chunks)
         
-        # Estimate score improvements
         score_increase = min(2.0, (10 - analysis.get('automation_feasibility_score', 5)) * 0.3)
         
         return {
             "improved_content": improved_content,
-            "improvements_made": list(set(all_improvements))[:10],  # Deduplicate and limit
+            "improvements_made": list(set(all_improvements))[:10],
             "automation_score_increase": round(score_increase, 1),
             "new_clarity_score": min(10, analysis.get('clarity_score', 5) + score_increase * 0.4),
             "new_determinism_score": min(10, analysis.get('determinism_score', 5) + score_increase * 0.4),
@@ -874,21 +894,19 @@ class DocumentAutomationWorkflow:
         return round(sum(scores) / len(scores), 1)
 
     # ----------------------
-    # AGENT 4: Similarity matching (FIXED)
+    # AGENT 4: Similarity matching
     # ----------------------
 
     async def _generate_document_summary(self, cleaned_text: str, analysis: Dict) -> str:
-        """FIXED: Uses paragraph-based chunking for summary generation."""
         chunks = chunk_text_by_paragraphs(cleaned_text, max_chunk_size=4000, overlap_paragraphs=1)
         partial_summaries: List[str] = []
         
         for idx, chunk in enumerate(chunks):
             prompt = f"""
-            Summarize this automation/runbook CHUNK for similarity search.
-            Preserve purpose, systems, key steps and outcomes.
+            Summarize this automation/runbook document for similarity search.
+            Preserve purpose, systems, key steps, visual elements, and outcomes.
             Return 1–2 paragraphs.
 
-            CHUNK {idx+1}/{len(chunks)}:
             {chunk}
             """
             resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
@@ -979,7 +997,7 @@ class DocumentAutomationWorkflow:
         return state
 
     # ----------------------
-    # AGENT 5: Automation commands (FIXED)
+    # AGENT 5: Automation commands
     # ----------------------
 
     async def _automation_commands_agent(self, state: WorkflowState) -> WorkflowState:
@@ -994,16 +1012,15 @@ class DocumentAutomationWorkflow:
         return state
 
     async def _analyze_automation_commands(self, content: str, analysis: Dict) -> Dict[str, Any]:
-        """FIXED: Uses paragraph-based chunking for command analysis."""
         chunks = chunk_text_by_paragraphs(content, max_chunk_size=3500, overlap_paragraphs=1)
         all_automatable_steps = []
         all_ui_only_tasks = []
         
-        print(f"🤖 Analyzing commands in {len(chunks)} paragraph-based chunks...")
+        print(f"🤖 Analyzing automation potential...")
         
         for i, chunk in enumerate(chunks):
             prompt = f"""
-            Analyze this CHUNK and suggest specific automation commands for each step.
+            Analyze this document and suggest specific automation commands for each step.
 
             Return JSON:
             {{
@@ -1011,7 +1028,6 @@ class DocumentAutomationWorkflow:
               "ui_only_tasks": [...]
             }}
 
-            CHUNK {i+1}/{len(chunks)}:
             {chunk}
             """
             resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
@@ -1038,7 +1054,7 @@ class DocumentAutomationWorkflow:
         }
 
     # ----------------------
-    # AGENT 6: Script generation (UNCHANGED)
+    # AGENT 6: Script generation
     # ----------------------
 
     async def _script_generation_agent(self, state: WorkflowState) -> WorkflowState:
@@ -1062,7 +1078,7 @@ class DocumentAutomationWorkflow:
         explanation += f"- Automation Percentage: {percentage}%\n"
         explanation += "- Threshold Required: 30% minimum\n\n"
         explanation += "## Reasons for Low Automation Score:\n\n"
-        for i, t in enumerate(ui_tasks[:10], 1):  # Limit to 10
+        for i, t in enumerate(ui_tasks[:10], 1):
             task_desc = t if isinstance(t, str) else t.get('step_description', 'UI Task')
             explanation += f"{i}. {task_desc}\n"
         return {
@@ -1127,7 +1143,7 @@ class DocumentAutomationWorkflow:
         return data
 
     # ----------------------
-    # Public entrypoints (UNCHANGED - Image processing preserved)
+    # Public entrypoints
     # ----------------------
 
     async def process_text_document(self, text_file_path: str) -> Dict[str, Any]:
@@ -1178,7 +1194,7 @@ class DocumentAutomationWorkflow:
         }
 
     async def process_document(self, pdf_path: str) -> Dict[str, Any]:
-        """Process PDF documents (with image analysis)"""
+        """Process PDF documents (with image analysis embedded in content)"""
         initial_state = WorkflowState(
             pdf_path=pdf_path,
             parsed_content={},
