@@ -161,7 +161,7 @@ if st.session_state.results:
         "📜 Script Generation"
     ])
     
-    # TAB 1: Raw Extracted Content (unchanged from previous version)
+    # TAB 1: Raw Extracted Content
     with tab1:
         st.subheader("📄 Raw Extracted Content")
         
@@ -241,7 +241,7 @@ if st.session_state.results:
                     if i < len(image_analyses):
                         st.markdown("---")
     
-    # TAB 2: Cleaned Content (unchanged)
+    # TAB 2: Cleaned Content
     with tab2:
         st.subheader("🧹 Cleaned & Processed Content")
         
@@ -332,7 +332,7 @@ if st.session_state.results:
                 st.success(phrases)
                 st.caption(f"AI identified {len(structured['key_phrases'])} key automation-relevant terms from the document")
     
-    # TAB 3: Automation Analysis (WITH VAGUE TERM REMEDIATION - NEW)
+    # TAB 3: Automation Analysis (WITH VAGUE TERM REMEDIATION)
     with tab3:
         st.subheader("🤖 Comprehensive Runbook Analysis")
         analysis = results['automation_analysis']
@@ -396,7 +396,7 @@ if st.session_state.results:
         
         st.divider()
         
-        # QUALITY FLAGS SECTION WITH VAGUE TERM REMEDIATION (NEW)
+        # QUALITY FLAGS SECTION WITH VAGUE TERM REMEDIATION
         st.markdown("#### 🔍 Quality Flags & Issues")
         rule_data = analysis.get('rule_data', {})
         quality_flags = rule_data.get('quality_flags', {})
@@ -405,7 +405,7 @@ if st.session_state.results:
         col1, col2 = st.columns(2)
         
         with col1:
-            # VAGUE TERMS WITH REMEDIATION (NEW)
+            # VAGUE TERMS WITH REMEDIATION
             st.markdown("##### ⚠️ Vague Terms & Remediation")
             vague_count = quality_flags.get('vague_terms', 0)
             st.metric("Count", vague_count)
@@ -522,8 +522,300 @@ if st.session_state.results:
             else:
                 st.info("No commands found")
     
-    # TAB 4, 5, 6: Similar Automations, Improved Document, Script Generation (unchanged from previous version)
-    # ... (keeping the rest of the tabs unchanged for brevity - they remain the same as before)
+    # TAB 4: Similar Automations (FULLY RESTORED)
+    with tab4:
+        st.subheader("🔍 Similar Existing Automations")
+        
+        if 'similarity_matches' in results and results['similarity_matches']:
+            similarity_data = results['similarity_matches']
+            
+            # Check for errors
+            if 'error' in similarity_data:
+                st.warning(f"⚠️ Similarity matching unavailable: {similarity_data['error']}")
+                st.info("💡 Make sure the database is set up and embeddings are initialized")
+            else:
+                st.markdown("#### 📄 Document Summary")
+                st.info(similarity_data.get('document_summary', 'No summary available'))
+                
+                similar_automations = similarity_data.get('similar_automations', [])
+                
+                if similar_automations:
+                    st.markdown(f"#### 🎯 Top {len(similar_automations)} Similar Automations")
+                    st.success(f"Found {similarity_data.get('total_matches_found', 0)} matching automations in the database")
+                    
+                    for i, automation in enumerate(similar_automations, 1):
+                        similarity_pct = automation.get('similarity_percentage', 0)
+                        
+                        if similarity_pct >= 80:
+                            color = "🟢"
+                            badge_color = "success"
+                        elif similarity_pct >= 60:
+                            color = "🟡"
+                            badge_color = "warning"
+                        else:
+                            color = "🔴"
+                            badge_color = "error"
+                        
+                        with st.expander(
+                            f"{color} **{i}. {automation.get('automation_name', 'Unknown')}** - {similarity_pct}% Similar",
+                            expanded=(i == 1)
+                        ):
+                            col1, col2 = st.columns([3, 1])
+                            
+                            with col1:
+                                st.markdown(f"**Automation Name:** {automation.get('automation_name', 'N/A')}")
+                            
+                            with col2:
+                                if badge_color == "success":
+                                    st.success(f"✅ {similarity_pct}%")
+                                elif badge_color == "warning":
+                                    st.warning(f"⚠️ {similarity_pct}%")
+                                else:
+                                    st.error(f"❌ {similarity_pct}%")
+                            
+                            st.markdown("**Description:**")
+                            st.write(automation.get('description', 'No description available'))
+                            
+                            st.markdown("**Automation Steps:**")
+                            steps_text = automation.get('steps', 'No steps available')
+                            st.text_area(
+                                "Steps",
+                                value=steps_text,
+                                height=200,
+                                disabled=True,
+                                key=f"steps_{i}",
+                                label_visibility="collapsed"
+                            )
+                            
+                            st.markdown("**Similarity Interpretation:**")
+                            if similarity_pct >= 80:
+                                st.success("✅ Very High Similarity - This existing automation is very similar to your document")
+                            elif similarity_pct >= 60:
+                                st.warning("⚠️ Moderate Similarity - This automation shares some characteristics with your document")
+                            else:
+                                st.info("ℹ️ Low Similarity - This automation has some related elements but significant differences")
+                else:
+                    st.info("ℹ️ No similar automations found in the database")
+        else:
+            st.info("ℹ️ No similarity matching data available")
+    
+    # TAB 5: Improved Document (FULLY RESTORED)
+    with tab5:
+        st.subheader("✨ AI-Improved Document")
+        
+        improved = results.get('improved_document', {})
+        
+        if improved:
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                st.markdown("#### 📝 Enhanced Content")
+                with st.expander("📄 View Improved Document", expanded=True):
+                    improved_content = improved.get('improved_content', 'No improved content available')
+                    st.text_area(
+                        "Improved Content",
+                        value=improved_content,
+                        height=500,
+                        disabled=True,
+                        label_visibility="hidden"
+                    )
+            
+            with col2:
+                st.markdown("#### 📈 Improvements Made")
+                
+                score_increase = improved.get('automation_score_increase', 0)
+                st.metric("Score Increase", f"+{score_increase:.1f}")
+                
+                st.write("**New Scores:**")
+                st.metric("Clarity", f"{improved.get('new_clarity_score', 0):.1f}/10")
+                st.metric("Determinism", f"{improved.get('new_determinism_score', 0):.1f}/10")
+                st.metric("Feasibility", f"{improved.get('new_automation_feasibility', 0):.1f}/10")
+            
+            st.divider()
+            
+            st.markdown("#### 🔧 List of Improvements")
+            improvements_made = improved.get('improvements_made', [])
+            
+            if improvements_made:
+                for i, improvement in enumerate(improvements_made, 1):
+                    st.write(f"✅ **{i}.** {improvement}")
+            else:
+                st.info("No specific improvements listed")
+            
+            # Download button
+            if improved.get('improved_content'):
+                st.download_button(
+                    label="⬇️ Download Improved Document",
+                    data=improved.get('improved_content', ''),
+                    file_name="improved_document.txt",
+                    mime="text/plain"
+                )
+        else:
+            st.info("No improved document available")
+    
+    # TAB 6: Generated Script (FULLY RESTORED)
+    with tab6:
+        st.subheader("📜 Generated Automation Script")
+        
+        script = results.get('generated_script', {})
+        
+        if script:
+            script_type = script.get('script_type', 'Unknown')
+            automation_viable = script.get('automation_viable', False)
+            automation_pct = script.get('automation_percentage', 0)
+            
+            # Status banner
+            if automation_viable:
+                st.success(f"✅ **{script_type}** - Automation is viable ({automation_pct:.1f}% automatable)")
+            else:
+                st.warning(f"⚠️ **{script_type}** - Automation below threshold ({automation_pct:.1f}% automatable)")
+            
+            st.divider()
+            
+            if automation_viable:
+                # Script details
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    st.markdown("#### 🐍 Python Script")
+                    
+                    script_code = script.get('code', '# No code generated')
+                    st.code(script_code, language='python')
+                    
+                    # Download button
+                    st.download_button(
+                        label="⬇️ Download Script",
+                        data=script_code,
+                        file_name="automation_script.py",
+                        mime="text/x-python"
+                    )
+                
+                with col2:
+                    st.markdown("#### 📋 Script Information")
+                    
+                    st.write("**Description:**")
+                    st.info(script.get('script_description', 'N/A'))
+                    
+                    st.write("**Automation Coverage:**")
+                    st.write(script.get('automation_coverage', 'N/A'))
+                    
+                    st.write("**Notes:**")
+                    st.write(script.get('notes', 'N/A'))
+                
+                st.divider()
+                
+                # Requirements and execution
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.markdown("##### 📦 Requirements")
+                    requirements = script.get('requirements', [])
+                    if requirements:
+                        for req in requirements:
+                            st.code(req, language=None)
+                    else:
+                        st.info("No requirements specified")
+                
+                with col2:
+                    st.markdown("##### ▶️ Execution Steps")
+                    execution_steps = script.get('execution_steps', [])
+                    if execution_steps:
+                        for i, step in enumerate(execution_steps, 1):
+                            st.write(f"{i}. {step}")
+                    else:
+                        st.info("No execution steps provided")
+                
+                with col3:
+                    st.markdown("##### ⚙️ Parameters Required")
+                    parameters = script.get('parameters_required', [])
+                    if parameters:
+                        for param in parameters:
+                            st.write(f"• {param}")
+                    else:
+                        st.info("No parameters required")
+                
+                st.divider()
+                
+                # Manual steps remaining
+                st.markdown("#### 👤 Manual Steps Remaining")
+                manual_steps = script.get('manual_steps_remaining', [])
+                if manual_steps:
+                    st.warning("⚠️ These steps still require manual intervention:")
+                    for i, step in enumerate(manual_steps, 1):
+                        st.write(f"{i}. {step}")
+                else:
+                    st.success("✅ All steps can be automated!")
+                
+                # Download options
+                st.divider()
+                st.markdown("#### 📥 Download Files")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    if script.get('code'):
+                        st.download_button(
+                            label="📥 Download Python Script",
+                            data=script['code'],
+                            file_name="automation_script.py",
+                            mime="text/x-python",
+                            help="Download the complete Python automation script"
+                        )
+                
+                with col2:
+                    if script.get('requirements'):
+                        requirements_content = "\n".join(script['requirements'])
+                        st.download_button(
+                            label="📥 Download Requirements.txt",
+                            data=requirements_content,
+                            file_name="requirements.txt",
+                            mime="text/plain",
+                            help="Python packages required for the script"
+                        )
+                
+                with col3:
+                    if script.get('execution_steps'):
+                        instructions_content = "# Script Execution Instructions\n\n"
+                        for i, step in enumerate(script['execution_steps'], 1):
+                            instructions_content += f"{i}. {step}\n"
+                        if script.get('parameters_required'):
+                            instructions_content += "\n## Required Parameters\n"
+                            for param in script['parameters_required']:
+                                instructions_content += f"- {param}\n"
+                        st.download_button(
+                            label="📥 Download Instructions",
+                            data=instructions_content,
+                            file_name="execution_instructions.md",
+                            mime="text/markdown",
+                            help="Step-by-step instructions to run the script"
+                        )
+                
+                # Required Python Packages
+                if script.get('requirements'):
+                    st.divider()
+                    st.markdown("#### 📦 Required Python Packages")
+                    deps_display = []
+                    for dep in script['requirements']:
+                        deps_display.append(f"`{dep}`")
+                    st.markdown(" • ".join(deps_display))
+            
+            else:
+                # Low automation explanation
+                st.markdown("#### 📊 Analysis Report")
+                
+                explanation = script.get('explanation', 'No explanation available')
+                st.text(explanation)
+                
+                st.divider()
+                
+                st.markdown("#### 💡 Recommendations to Improve Automation Score")
+                recommendations = script.get('recommendations', [])
+                if recommendations:
+                    for i, rec in enumerate(recommendations, 1):
+                        st.write(f"**{i}.** {rec}")
+                else:
+                    st.info("No recommendations available")
+        else:
+            st.info("No script generation data available")
 
 # Clear results button
 if st.session_state.get('results'):
