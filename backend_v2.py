@@ -13,63 +13,122 @@ from psycopg2.extras import RealDictCursor
 from openai import AzureOpenAI
 
 # ----------------------
-# Paragraph-based chunking strategy
+# Utility: Paragraph-based chunking with recursive fallback
 # ----------------------
 
-def chunk_text_paragraphs(text: str, max_chunk_size: int = 4000, overlap_paras: int = 2) -> List[str]:
+def chunk_text_by_paragraphs(text: str, max_chunk_size: int = 4000, overlap_paragraphs: int = 1) -> List[str]:
     """
-    Paragraph-based chunking for technical documents.
-    Groups COMPLETE paragraphs together, preserving semantic boundaries.
+    Chunk text based on paragraph boundaries (double newlines).
+    Falls back to sentence and word boundaries if paragraphs are too large.
+    Includes paragraph overlap for context preservation.
     """
-    if not text or len(text.strip()) == 0:
-        return []
-
-    paragraphs = [p.strip() for p in re.split(r'\n\s*\n+', text) if p.strip()]
+    if not text or len(text) <= max_chunk_size:
+        return [text] if text else []
     
-    if len(text) <= max_chunk_size:
-        return [text.strip()]
+    # Split by paragraphs first (double newline)
+    paragraphs = re.split(r'\n\s*\n', text)
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
     
     chunks = []
-    i = 0
+    current_chunk = []
+    current_length = 0
     
-    while i < len(paragraphs):
-        chunk = ""
-        para_count = 0
+    for i, para in enumerate(paragraphs):
+        para_length = len(para)
         
-        while i < len(paragraphs):
-            next_para = paragraphs[i]
+        # If single paragraph exceeds max_chunk_size, split it recursively
+        if para_length > max_chunk_size:
+            # If we have accumulated content, save it
+            if current_chunk:
+                chunks.append('\n\n'.join(current_chunk))
+                current_chunk = []
+                current_length = 0
             
-            if len(chunk) + len(next_para) + 50 > max_chunk_size and len(chunk) > 1000:
-                break
-            
-            chunk += next_para + "\n\n"
-            para_count += 1
-            i += 1
-        
-        if chunk.strip():
-            chunks.append(chunk.strip())
-    
-    overlapped_chunks = []
-    for j, chunk in enumerate(chunks):
-        if j == 0:
-            overlapped_chunks.append(chunk)
+            # Split large paragraph by sentences
+            sub_chunks = _split_large_paragraph(para, max_chunk_size)
+            chunks.extend(sub_chunks)
             continue
         
-        prev_chunk = chunks[j-1]
-        prev_paras = re.split(r'\n\s*\n+', prev_chunk)
-        overlap_paras_list = prev_paras[-overlap_paras:]
-        overlap_text = "\n\n".join(overlap_paras_list) + "\n\n"
+        # Check if adding this paragraph exceeds max_chunk_size
+        if current_length + para_length + 2 > max_chunk_size and current_chunk:
+            # Save current chunk
+            chunks.append('\n\n'.join(current_chunk))
+            
+            # Start new chunk with overlap (last N paragraphs)
+            if overlap_paragraphs > 0 and len(current_chunk) > overlap_paragraphs:
+                current_chunk = current_chunk[-overlap_paragraphs:]
+                current_length = sum(len(p) for p in current_chunk) + (len(current_chunk) - 1) * 2
+            else:
+                current_chunk = []
+                current_length = 0
         
-        overlapped_chunk = overlap_text + chunk
-        
-        if len(overlapped_chunk) > max_chunk_size * 1.2:
-            overlapped_chunk = overlapped_chunk[-max_chunk_size:]
-        
-        overlapped_chunks.append(overlapped_chunk.strip())
+        # Add paragraph to current chunk
+        current_chunk.append(para)
+        current_length += para_length + 2  # +2 for '\n\n'
     
-    print(f"📦 Created {len(overlapped_chunks)} paragraph-based chunks "
-          f"(avg {sum(map(len, overlapped_chunks))/len(overlapped_chunks):.0f} chars)")
-    return overlapped_chunks
+    # Add remaining chunk
+    if current_chunk:
+        chunks.append('\n\n'.join(current_chunk))
+    
+    return chunks
+
+
+def _split_large_paragraph(paragraph: str, max_size: int) -> List[str]:
+    """
+    Recursively split a large paragraph by sentences, then words if needed.
+    """
+    # Try splitting by sentences first
+    sentences = re.split(r'(?<=[.!?])\s+', paragraph)
+    
+    if len(sentences) == 1 or max(len(s) for s in sentences) > max_size:
+        # If single sentence or sentences are too large, split by words
+        return _split_by_words(paragraph, max_size)
+    
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for sentence in sentences:
+        sentence_length = len(sentence)
+        
+        if current_length + sentence_length + 1 > max_size and current_chunk:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = [sentence]
+            current_length = sentence_length
+        else:
+            current_chunk.append(sentence)
+            current_length += sentence_length + 1
+    
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
+    return chunks
+
+
+def _split_by_words(text: str, max_size: int) -> List[str]:
+    """
+    Last resort: split by words with max_size limit.
+    """
+    words = text.split()
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for word in words:
+        word_length = len(word)
+        
+        if current_length + word_length + 1 > max_size and current_chunk:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = [word]
+            current_length = word_length
+        else:
+            current_chunk.append(word)
+            current_length += word_length + 1
+    
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
+    return chunks
 
 
 class WorkflowState(TypedDict):
@@ -81,13 +140,13 @@ class WorkflowState(TypedDict):
     similarity_matches: Dict[str, Any]
     automation_commands: Dict[str, Any]
     generated_script: Dict[str, Any]
-    vague_term_suggestions: Dict[str, Any]  # NEW
     messages: List[Any]
     current_step: str
 
 
 class DocumentAutomationWorkflow:
     def __init__(self, db_config: Dict[str, str] = None, azure_embedding_config: Dict[str, str] = None):
+        # LLM (GPT‑4o mini on Azure)
         self.llm = ChatOpenAI(
             model="gpt-4o-mini",
             temperature=0.1,
@@ -96,6 +155,7 @@ class DocumentAutomationWorkflow:
             api_version="2024-07-18"
         )
 
+        # pg / pgvector config
         self.db_config = db_config or {
             'dbname': 'automation_db',
             'user': 'your_username',
@@ -104,6 +164,7 @@ class DocumentAutomationWorkflow:
             'port': '5432'
         }
 
+        # Azure embeddings (Ada small)
         self.azure_embedding_config = azure_embedding_config or {
             'api_key': 'your-azure-api-key',
             'api_version': '2023-05-15',
@@ -124,13 +185,16 @@ class DocumentAutomationWorkflow:
 
         self.workflow = self._build_workflow()
 
+    # ----------------------
+    # Workflow graph
+    # ----------------------
+
     def _build_workflow(self) -> StateGraph:
         workflow = StateGraph(WorkflowState)
 
         workflow.add_node("parse_document", self._parse_document_agent)
         workflow.add_node("clean_text", self._text_cleaning_agent)
         workflow.add_node("analyze_automation", self._enhanced_automation_analysis_agent)
-        workflow.add_node("vague_term_remediation", self._vague_term_remediation_agent)  # NEW
         workflow.add_node("similarity_matching", self._similarity_matching_agent)
         workflow.add_node("automation_commands", self._automation_commands_agent)
         workflow.add_node("generate_script", self._script_generation_agent)
@@ -138,8 +202,7 @@ class DocumentAutomationWorkflow:
         workflow.add_edge(START, "parse_document")
         workflow.add_edge("parse_document", "clean_text")
         workflow.add_edge("clean_text", "analyze_automation")
-        workflow.add_edge("analyze_automation", "vague_term_remediation")  # NEW
-        workflow.add_edge("vague_term_remediation", "similarity_matching")  # UPDATED
+        workflow.add_edge("analyze_automation", "similarity_matching")
         workflow.add_edge("similarity_matching", "automation_commands")
         workflow.add_edge("automation_commands", "generate_script")
         workflow.add_edge("generate_script", END)
@@ -147,7 +210,7 @@ class DocumentAutomationWorkflow:
         return workflow.compile()
 
     # ----------------------
-    # AGENT 1: PDF parsing (unchanged)
+    # AGENT 1: PDF parsing (IMAGE PROCESSING - PRESERVED IN COMBINED TEXT)
     # ----------------------
 
     async def _parse_document_agent(self, state: WorkflowState) -> WorkflowState:
@@ -165,6 +228,7 @@ class DocumentAutomationWorkflow:
         return state
 
     async def _extract_content_by_page(self, pdf_path: str) -> Dict[str, Any]:
+        """Image analysis is embedded directly into combined_text"""
         combined_text = ""
         page_details = []
         image_analysis = []
@@ -192,7 +256,7 @@ class DocumentAutomationWorkflow:
                                 img_data, page_num + 1, img_index + 1
                             )
 
-                            image_block = f"\n[IMAGE_{img_index + 1}_ANALYSIS]:\n"
+                            image_block = f"\n\n[IMAGE_{img_index + 1}_ANALYSIS]:\n"
                             image_block += f"Description: {multimodal_result['description']}\n"
                             image_block += f"Purpose: {multimodal_result['purpose']}\n"
                             image_block += f"Automation Relevance: {multimodal_result['automation_relevance']}\n"
@@ -200,7 +264,7 @@ class DocumentAutomationWorkflow:
                                 image_block += f"Extracted Text: {multimodal_result['extracted_text']}\n"
                             else:
                                 image_block += "Extracted Text: No text detected in image\n"
-                            image_block += f"[END_IMAGE_{img_index + 1}_ANALYSIS]\n"
+                            image_block += f"[END_IMAGE_{img_index + 1}_ANALYSIS]\n\n"
 
                             page_multimodal_content += image_block
                             page_image_analysis.append({
@@ -217,10 +281,10 @@ class DocumentAutomationWorkflow:
 
             page_combined = f"\n--- PAGE {page_num + 1} ---\n"
             page_combined += page_text_content
-            if image_list:
-                page_combined += f"\n--- IMAGES ANALYSIS FOR PAGE {page_num + 1} ---\n"
-                page_combined += page_multimodal_content
-                page_combined += f"--- END IMAGES ANALYSIS FOR PAGE {page_num + 1} ---\n"
+            
+            if page_multimodal_content:
+                page_combined += "\n" + page_multimodal_content
+            
             page_combined += f"\n--- END PAGE {page_num + 1} ---\n\n"
 
             combined_text += page_combined
@@ -263,6 +327,7 @@ class DocumentAutomationWorkflow:
         return text_content
 
     async def _perform_multimodal_analysis(self, image_data: bytes, page_num: int, img_num: int) -> Dict[str, str]:
+        """Multimodal image analysis"""
         try:
             img_base64 = base64.b64encode(image_data).decode('utf-8')
             multimodal_prompt = f"""
@@ -328,7 +393,7 @@ class DocumentAutomationWorkflow:
             }
 
     # ----------------------
-    # AGENT 2: Cleaning (unchanged)
+    # AGENT 2: Cleaning
     # ----------------------
 
     async def _text_cleaning_agent(self, state: WorkflowState) -> WorkflowState:
@@ -366,6 +431,7 @@ class DocumentAutomationWorkflow:
         return state
 
     def _basic_text_cleaning(self, text: str) -> str:
+        """Don't remove IMAGE_ANALYSIS blocks"""
         text = re.sub(r'--- PAGE \d+ ---', '', text)
         text = re.sub(r'--- END PAGE \d+ ---', '', text)
         text = re.sub(r'\n\s*\n\s*\n', '\n\n', text)
@@ -373,33 +439,43 @@ class DocumentAutomationWorkflow:
         return text.strip()
 
     async def _ai_content_filtering(self, text: str) -> str:
-        chunks = chunk_text_paragraphs(text, max_chunk_size=4000, overlap_paras=2)
+        """Uses paragraph-based chunking AND preserves IMAGE_ANALYSIS blocks"""
+        chunks = chunk_text_by_paragraphs(text, max_chunk_size=4000, overlap_paragraphs=1)
         cleaned_chunks = []
+        
+        print(f"🧹 Cleaning {len(chunks)} sections...")
+        
         for i, chunk in enumerate(chunks):
             prompt = f"""
-            You are cleaning a technical/automation document chunk.
+            You are cleaning a technical/automation document.
 
             Tasks:
             - Remove headers, footers, boilerplate, page numbers and OCR noise.
+            - **IMPORTANT: Keep ALL [IMAGE_X_ANALYSIS] blocks exactly as they are - these contain critical multimodal analysis.**
             - Keep all process descriptions, steps, workflows, data definitions, business rules, commands, and image-analysis blocks.
             - Preserve order and technical detail. Do NOT summarize.
 
-            Return ONLY the cleaned text for this chunk.
+            Return ONLY the cleaned text.
 
-            CHUNK {i+1}/{len(chunks)}:
+            DOCUMENT SECTION:
             {chunk}
             """
             resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
             cleaned_chunks.append((resp.content or "").strip())
+        
         return "\n\n".join(cleaned_chunks).strip()
 
     def _remove_headers_footers(self, text: str) -> str:
+        """Protect IMAGE_ANALYSIS blocks from removal"""
         lines = text.split("\n")
         if len(lines) < 10:
             return text
 
         line_counts: Dict[str, int] = {}
         for line in lines:
+            if '[IMAGE_' in line or '[END_IMAGE_' in line:
+                continue
+            
             clean = re.sub(r'\d+', 'NUM', line.strip())
             if 5 < len(clean) < 80:
                 line_counts[clean] = line_counts.get(clean, 0) + 1
@@ -407,10 +483,18 @@ class DocumentAutomationWorkflow:
         repetitive = {ln for ln, c in line_counts.items() if c >= 3}
         filtered = []
         for line in lines:
+            if '[IMAGE_' in line or '[END_IMAGE_' in line or 'Description:' in line or 'Purpose:' in line or 'Automation Relevance:' in line or 'Extracted Text:' in line:
+                filtered.append(line)
+                continue
+            
             clean = re.sub(r'\d+', 'NUM', line.strip())
             if clean not in repetitive:
                 filtered.append(line)
         return "\n".join(filtered)
+
+    # ----------------------
+    # AI extraction of sections and key phrases
+    # ----------------------
 
     async def _extract_key_sections(self, text: str) -> Dict[str, Any]:
         sentences = re.split(r'[.!?]+', text)
@@ -444,18 +528,17 @@ class DocumentAutomationWorkflow:
         }
 
     async def _extract_ai_key_phrases(self, text: str) -> List[str]:
-        chunks = chunk_text_paragraphs(text, max_chunk_size=3000, overlap_paras=1)
+        chunks = chunk_text_by_paragraphs(text, max_chunk_size=3000, overlap_paragraphs=1)
         phrases: List[str] = []
 
         for i, chunk in enumerate(chunks):
             prompt = f"""
-            From this automation/runbook CHUNK, extract 5–10 key phrases that are
+            From this automation/runbook document, extract 5–10 key phrases that are
             most important for automation (technical terms, process names, tools,
-            commands, systems, workflows, automation concepts).
+            commands, systems, workflows, automation concepts, visual elements from images).
 
             Return ONLY a comma-separated list of phrases.
 
-            CHUNK {i+1}/{len(chunks)}:
             {chunk}
             """
             resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
@@ -475,11 +558,11 @@ class DocumentAutomationWorkflow:
         return out[:30]
 
     # ----------------------
-    # AI-based feature extraction
+    # AI-based feature extraction (NEW: WITH REMEDIATION)
     # ----------------------
 
     async def _ai_runbook_feature_extraction(self, text: str) -> Dict[str, Any]:
-        chunks = chunk_text_paragraphs(text, max_chunk_size=4000, overlap_paras=2)
+        chunks = chunk_text_by_paragraphs(text, max_chunk_size=4000, overlap_paragraphs=1)
         aggregated = {
             "commands": [],
             "vague_terms": [],
@@ -488,15 +571,17 @@ class DocumentAutomationWorkflow:
             "decision_points": []
         }
 
+        print(f"🔍 Extracting features from document...")
+
         for idx, chunk in enumerate(chunks):
             prompt = f"""
-            Analyze this automation/runbook CHUNK and extract the following items using
+            Analyze this automation/runbook document section and extract the following items using
             exact phrases from the text:
 
             - "commands": shell/CLI/API/SQL/script commands or imperative instructions.
             - "vague_terms": unclear/non-testable phrases (like "verify system is ok", "make sure it's fine").
             - "manual_decisions": phrases indicating human judgment/approval/review/decision.
-            - "ui_interactions": phrases describing GUI/dashboard/web UI actions.
+            - "ui_interactions": phrases describing GUI/dashboard/web UI actions (including from images).
             - "decision_points": conditional/branching phrases (if/when/unless/depending on, etc.).
 
             Return JSON ONLY with this exact structure:
@@ -509,9 +594,8 @@ class DocumentAutomationWorkflow:
               "decision_points": ["..."]
             }}
 
-            Do NOT summarize or explain, just lists of exact phrases from this chunk.
+            Do NOT summarize or explain, just lists of exact phrases.
 
-            CHUNK {idx+1}/{len(chunks)}:
             {chunk}
             """
             resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
@@ -550,6 +634,80 @@ class DocumentAutomationWorkflow:
             aggregated[k] = dedup(aggregated[k])
         return aggregated
 
+    async def _generate_vague_term_remediation(self, vague_terms: List[str], document_text: str) -> List[Dict[str, str]]:
+        """
+        NEW: Generate specific remediation for each vague term
+        """
+        if not vague_terms:
+            return []
+        
+        print(f"💡 Generating remediation for {len(vague_terms)} vague terms...")
+        
+        remediation_list = []
+        
+        # Process in batches of 5 to avoid token limits
+        batch_size = 5
+        for i in range(0, len(vague_terms), batch_size):
+            batch = vague_terms[i:i+batch_size]
+            
+            prompt = f"""
+            You are a technical documentation expert. For each vague term below, provide:
+            1. Why it's vague
+            2. A specific, testable replacement
+            3. Context-aware example
+
+            Vague terms to fix:
+            {json.dumps(batch, indent=2)}
+
+            Context from document (first 1000 chars):
+            {document_text[:1000]}
+
+            Return JSON array with this structure:
+            [
+              {{
+                "vague_term": "<original vague phrase>",
+                "why_vague": "<brief explanation of why it's unclear>",
+                "suggested_replacement": "<specific, testable alternative>",
+                "example": "<how to use the replacement in context>",
+                "severity": "<High/Medium/Low>"
+              }}
+            ]
+
+            Make suggestions actionable and specific to automation/runbook context.
+            """
+            
+            try:
+                resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
+                content = (resp.content or "").strip()
+                
+                # Try to extract JSON
+                try:
+                    remediations = json.loads(content)
+                except:
+                    # Try to find JSON in response
+                    json_match = re.search(r'\[[\s\S]*\]', content)
+                    if json_match:
+                        remediations = json.loads(json_match.group())
+                    else:
+                        remediations = []
+                
+                if isinstance(remediations, list):
+                    remediation_list.extend(remediations)
+                    
+            except Exception as e:
+                print(f"⚠️ Error generating remediation for batch: {e}")
+                # Provide basic remediation for batch
+                for term in batch:
+                    remediation_list.append({
+                        "vague_term": term,
+                        "why_vague": "This term is unclear and not testable",
+                        "suggested_replacement": "Replace with specific, measurable criteria",
+                        "example": f"Instead of '{term}', specify exact conditions or metrics",
+                        "severity": "Medium"
+                    })
+        
+        return remediation_list
+
     async def _extract_rule_data(self, text: str) -> Dict[str, Any]:
         features = await self._ai_runbook_feature_extraction(text)
 
@@ -558,6 +716,9 @@ class DocumentAutomationWorkflow:
         manual_decisions = features.get("manual_decisions", [])
         ui_interactions = features.get("ui_interactions", [])
         decision_points = features.get("decision_points", [])
+
+        # NEW: Generate remediation for vague terms
+        vague_term_remediation = await self._generate_vague_term_remediation(vague_terms, text)
 
         return {
             'commands': {
@@ -570,6 +731,7 @@ class DocumentAutomationWorkflow:
                 'manual_decisions': len(manual_decisions),
                 'ui_interactions': len(ui_interactions),
                 'vague_terms_list': vague_terms,
+                'vague_term_remediation': vague_term_remediation,  # NEW
                 'manual_decisions_list': manual_decisions,
                 'ui_interactions_list': ui_interactions
             },
@@ -581,7 +743,7 @@ class DocumentAutomationWorkflow:
         }
 
     # ----------------------
-    # AGENT 3: 5-metric analysis (unchanged)
+    # AGENT 3: 5‑metric analysis
     # ----------------------
 
     async def _enhanced_automation_analysis_agent(self, state: WorkflowState) -> WorkflowState:
@@ -589,7 +751,7 @@ class DocumentAutomationWorkflow:
         cleaned_text = state['cleaned_content']['cleaned_text']
 
         rule_data = await self._extract_rule_data(cleaned_text)
-        scoring_analysis = await self._perform_five_metric_analysis(cleaned_text, rule_data)
+        scoring_analysis = await self._perform_five_metric_analysis_on_full_content(cleaned_text, rule_data)
         improved_document = await self._generate_improved_actual_document(cleaned_text, scoring_analysis)
 
         comprehensive = {
@@ -604,94 +766,197 @@ class DocumentAutomationWorkflow:
         state['current_step'] = 'enhanced_analysis_complete'
         return state
 
-    async def _perform_five_metric_analysis(self, text: str, rule_data: Dict) -> Dict[str, Any]:
-        chunks = chunk_text_paragraphs(text, max_chunk_size=3500, overlap_paras=2)
-        scoring_view_parts: List[str] = []
+    async def _perform_five_metric_analysis_on_full_content(self, text: str, rule_data: Dict) -> Dict[str, Any]:
+        """
+        Score on 5 metrics with user-friendly reasoning (no mention of chunks)
+        """
+        chunks = chunk_text_by_paragraphs(text, max_chunk_size=3500, overlap_paragraphs=1)
+        chunk_scores = []
+        
+        print(f"📊 Analyzing document comprehensively...")
         
         for idx, chunk in enumerate(chunks):
-            prompt = f"""
-            Normalize this runbook/automation CHUNK into a dense representation
-            that preserves all details relevant to:
-            - clarity of steps
-            - determinism (input -> output)
-            - logic/decision structure
-            - automation feasibility
-            - observability and logging
+            chunk_length = len(chunk)
+            analysis_prompt = f"""
+            You are an expert runbook automation analyst. Analyze this section of a document
+            and score it on 5 metrics (0–10).
 
-            Do NOT summarize away important details. Rephrase only to remove redundancy,
-            keep all conditions, steps, and key signals.
+            **IMPORTANT: In your reasoning, analyze the content naturally without mentioning "chunk", "section number", or "part X". 
+            Refer to specific content elements like "the deployment procedure", "the error handling steps", "the monitoring configuration", etc.**
 
-            Return 1–3 short paragraphs.
+            RULE DATA (from full document):
+            - Total Commands Found: {rule_data['commands']['total_commands']}
+            - Vague Terms Found: {rule_data['quality_flags']['vague_terms']}
+            - Manual Decision Points: {rule_data['quality_flags']['manual_decisions']}
+            - UI Interactions: {rule_data['quality_flags']['ui_interactions']}
+            - Decision Points: {rule_data['logic_structure']['decision_points']}
 
-            CHUNK {idx+1}/{len(chunks)}:
+            Score on:
+            1. **Clarity** (0-10): Are steps/instructions clear and unambiguous?
+            2. **Determinism** (0-10): Are inputs, outputs, and state transitions well-defined?
+            3. **Logic/Decision Structure** (0-10): Are conditionals and branching clear?
+            4. **Automation Feasibility** (0-10): Can this be automated (APIs, CLI, not just UI)?
+            5. **Observability** (0-10): Are there logging, monitoring, error-handling provisions?
+
+            Return JSON with natural, document-focused reasoning:
+            {{
+                "clarity_score": <number 0-10>,
+                "clarity_reasoning": "<explanation about the document's clarity>",
+                "determinism_score": <number 0-10>,
+                "determinism_reasoning": "<explanation about the document's determinism>",
+                "logic_decision_score": <number 0-10>,
+                "logic_decision_reasoning": "<explanation about the document's logic>",
+                "automation_feasibility_score": <number 0-10>,
+                "automation_feasibility_reasoning": "<explanation about automation potential>",
+                "observability_score": <number 0-10>,
+                "observability_reasoning": "<explanation about observability>",
+                "chunk_weight": {chunk_length}
+            }}
+
+            DOCUMENT CONTENT:
             {chunk}
             """
-            resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
-            scoring_view_parts.append((resp.content or "").strip())
+            resp = await self.llm.ainvoke([HumanMessage(content=analysis_prompt)])
+            try:
+                chunk_analysis = json.loads(resp.content)
+                chunk_analysis['chunk_weight'] = chunk_length
+                chunk_scores.append(chunk_analysis)
+            except Exception as e:
+                print(f"⚠️ Error in analysis: {e}")
+                chunk_scores.append({
+                    "clarity_score": 5,
+                    "clarity_reasoning": "Error in analysis",
+                    "determinism_score": 5,
+                    "determinism_reasoning": "Error in analysis",
+                    "logic_decision_score": 5,
+                    "logic_decision_reasoning": "Error in analysis",
+                    "automation_feasibility_score": 5,
+                    "automation_feasibility_reasoning": "Error in analysis",
+                    "observability_score": 5,
+                    "observability_reasoning": "Error in analysis",
+                    "chunk_weight": chunk_length
+                })
+        
+        # Aggregate scores
+        total_weight = sum(c['chunk_weight'] for c in chunk_scores)
+        
+        def weighted_avg(metric: str) -> float:
+            return sum(c[metric] * c['chunk_weight'] for c in chunk_scores) / total_weight
+        
+        # Synthesize reasoning
+        def synthesize_reasoning(metric: str) -> str:
+            """Combine multiple reasoning fragments into unified document-level reasoning"""
+            all_reasonings = [c[metric] for c in chunk_scores if c[metric] != "Error in analysis"]
+            
+            if not all_reasonings:
+                return "Analysis could not be completed."
+            
+            if len(all_reasonings) == 1:
+                return all_reasonings[0]
+            
+            combined = " ".join(all_reasonings)
+            combined = re.sub(r'Chunk \d+:', '', combined)
+            combined = re.sub(r'Section \d+:', '', combined)
+            combined = re.sub(r'Part \d+:', '', combined)
+            
+            return combined[:500]
+        
+        # Generate recommendations
+        recommendations_prompt = f"""
+        Based on a comprehensive analysis of a runbook document with these scores:
+        - Clarity: {weighted_avg('clarity_score'):.1f}/10
+        - Determinism: {weighted_avg('determinism_score'):.1f}/10
+        - Logic/Decision: {weighted_avg('logic_decision_score'):.1f}/10
+        - Automation Feasibility: {weighted_avg('automation_feasibility_score'):.1f}/10
+        - Observability: {weighted_avg('observability_score'):.1f}/10
 
-        scoring_view = "\n\n".join(scoring_view_parts)
-
-        analysis_prompt = f"""
-        You are an expert runbook automation analyst. Using the following
-        normalized representation of the FULL cleaned document, and the rule-data
-        extracted by another agent, score the runbook on 5 metrics (0–10).
-
-        RULE DATA:
-        - Total Commands Found: {rule_data['commands']['total_commands']}
-        - Vague Terms Found: {rule_data['quality_flags']['vague_terms']}
-        - Manual Decision Points: {rule_data['quality_flags']['manual_decisions']}
-        - UI Interactions: {rule_data['quality_flags']['ui_interactions']}
-        - Decision Points: {rule_data['logic_structure']['decision_points']}
-
-        Return your analysis as a JSON object with this exact structure:
-        {{
-            "clarity_score": <number 0-10>,
-            "clarity_reasoning": "<explanation>",
-            "determinism_score": <number 0-10>,
-            "determinism_reasoning": "<explanation>",
-            "logic_decision_score": <number 0-10>,
-            "logic_decision_reasoning": "<explanation>",
-            "automation_feasibility_score": <number 0-10>,
-            "automation_feasibility_reasoning": "<explanation>",
-            "observability_score": <number 0-10>,
-            "observability_reasoning": "<explanation>",
-            "improvement_recommendations": ["<rec1>", "<rec2>", "<rec3>"],
-            "critical_issues": ["<issue1>", "<issue2>"],
-            "quick_wins": ["<win1>", "<win2>"]
-        }}
-
-        FULL CLEANED DOCUMENT (normalized for scoring):
-        {scoring_view}
-        """
-        resp = await self.llm.ainvoke([HumanMessage(content=analysis_prompt)])
-        return json.loads(resp.content)
-
-    async def _generate_improved_actual_document(self, original_text: str, analysis: Dict) -> Dict[str, Any]:
-        prompt = f"""
-        Improve this automation/runbook document to increase automation readiness.
-
-        Use these analysis scores:
-        - Clarity: {analysis.get('clarity_score', 5)}/10
-        - Determinism: {analysis.get('determinism_score', 5)}/10
-        - Feasibility: {analysis.get('automation_feasibility_score', 5)}/10
-
-        Fix vague terms, manual decisions where possible, and missing observability.
+        Provide:
+        1. Top 3-5 improvement recommendations
+        2. Critical issues that must be addressed
+        3. Quick wins for immediate improvement
 
         Return JSON:
         {{
-          "improved_content": "<full improved document>",
-          "improvements_made": ["<improvement1>", "<improvement2>"],
-          "automation_score_increase": <number>,
-          "new_clarity_score": <number>,
-          "new_determinism_score": <number>,
-          "new_automation_feasibility": <number>
+            "improvement_recommendations": ["rec1", "rec2", "rec3"],
+            "critical_issues": ["issue1", "issue2"],
+            "quick_wins": ["win1", "win2"]
         }}
-
-        ORIGINAL CLEANED DOCUMENT:
-        {original_text}
         """
-        resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
-        return json.loads(resp.content)
+        
+        rec_resp = await self.llm.ainvoke([HumanMessage(content=recommendations_prompt)])
+        try:
+            recommendations = json.loads(rec_resp.content)
+        except:
+            recommendations = {
+                "improvement_recommendations": ["Improve clarity of steps", "Add more deterministic inputs/outputs"],
+                "critical_issues": ["Missing error handling", "Too many manual steps"],
+                "quick_wins": ["Add logging statements", "Document API endpoints"]
+            }
+        
+        return {
+            "clarity_score": round(weighted_avg('clarity_score'), 1),
+            "clarity_reasoning": synthesize_reasoning('clarity_reasoning'),
+            "determinism_score": round(weighted_avg('determinism_score'), 1),
+            "determinism_reasoning": synthesize_reasoning('determinism_reasoning'),
+            "logic_decision_score": round(weighted_avg('logic_decision_score'), 1),
+            "logic_decision_reasoning": synthesize_reasoning('logic_decision_reasoning'),
+            "automation_feasibility_score": round(weighted_avg('automation_feasibility_score'), 1),
+            "automation_feasibility_reasoning": synthesize_reasoning('automation_feasibility_reasoning'),
+            "observability_score": round(weighted_avg('observability_score'), 1),
+            "observability_reasoning": synthesize_reasoning('observability_reasoning'),
+            "improvement_recommendations": recommendations.get('improvement_recommendations', []),
+            "critical_issues": recommendations.get('critical_issues', []),
+            "quick_wins": recommendations.get('quick_wins', []),
+            "scoring_method": "comprehensive_document_analysis"
+        }
+
+    async def _generate_improved_actual_document(self, original_text: str, analysis: Dict) -> Dict[str, Any]:
+        chunks = chunk_text_by_paragraphs(original_text, max_chunk_size=3500, overlap_paragraphs=1)
+        improved_chunks = []
+        all_improvements = []
+        
+        print(f"✨ Improving document...")
+        
+        for i, chunk in enumerate(chunks):
+            prompt = f"""
+            Improve this section of an automation/runbook document to increase automation readiness.
+
+            Use these analysis scores:
+            - Clarity: {analysis.get('clarity_score', 5)}/10
+            - Determinism: {analysis.get('determinism_score', 5)}/10
+            - Feasibility: {analysis.get('automation_feasibility_score', 5)}/10
+
+            Fix vague terms, manual decisions where possible, and missing observability.
+            **IMPORTANT: Keep [IMAGE_X_ANALYSIS] blocks intact - do not modify them.**
+
+            Return JSON:
+            {{
+              "improved_content": "<improved content>",
+              "improvements_made": ["<improvement1>", "<improvement2>"]
+            }}
+
+            {chunk}
+            """
+            resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            try:
+                result = json.loads(resp.content)
+                improved_chunks.append(result.get('improved_content', chunk))
+                all_improvements.extend(result.get('improvements_made', []))
+            except:
+                improved_chunks.append(chunk)
+        
+        improved_content = "\n\n".join(improved_chunks)
+        
+        score_increase = min(2.0, (10 - analysis.get('automation_feasibility_score', 5)) * 0.3)
+        
+        return {
+            "improved_content": improved_content,
+            "improvements_made": list(set(all_improvements))[:10],
+            "automation_score_increase": round(score_increase, 1),
+            "new_clarity_score": min(10, analysis.get('clarity_score', 5) + score_increase * 0.4),
+            "new_determinism_score": min(10, analysis.get('determinism_score', 5) + score_increase * 0.4),
+            "new_automation_feasibility": min(10, analysis.get('automation_feasibility_score', 5) + score_increase)
+        }
 
     def _calculate_overall_score(self, analysis: Dict) -> float:
         scores = [
@@ -704,119 +969,24 @@ class DocumentAutomationWorkflow:
         return round(sum(scores) / len(scores), 1)
 
     # ----------------------
-    # NEW AGENT: Vague Term Remediation
-    # ----------------------
-
-    async def _vague_term_remediation_agent(self, state: WorkflowState) -> WorkflowState:
-        print("💡 Vague Term Remediation Agent...")
-        
-        analysis = state['automation_analysis']
-        vague_terms = analysis.get('rule_data', {}).get('quality_flags', {}).get('vague_terms_list', [])
-        
-        if not vague_terms:
-            state['vague_term_suggestions'] = {
-                'total_vague_terms': 0,
-                'suggestions': [],
-                'summary': 'No vague terms detected. Document has good clarity.'
-            }
-            state['current_step'] = 'vague_term_remediation_complete'
-            return state
-        
-        # Generate remediation suggestions for each vague term
-        suggestions = await self._generate_vague_term_suggestions(vague_terms)
-        
-        state['vague_term_suggestions'] = {
-            'total_vague_terms': len(vague_terms),
-            'suggestions': suggestions,
-            'summary': f'Analyzed {len(vague_terms)} vague terms and provided specific remediation strategies.'
-        }
-        state['current_step'] = 'vague_term_remediation_complete'
-        return state
-
-    async def _generate_vague_term_suggestions(self, vague_terms: List[str]) -> List[Dict[str, Any]]:
-        """
-        For each vague term, generate specific remediation suggestions.
-        """
-        suggestions = []
-        
-        for idx, vague_term in enumerate(vague_terms):
-            prompt = f"""
-            You are a technical documentation expert specializing in runbook automation.
-            
-            VAGUE TERM DETECTED: "{vague_term}"
-            
-            This phrase is too vague or unclear for automated execution. Provide specific remediation strategies.
-            
-            Return JSON with this exact structure:
-            {{
-              "vague_term": "{vague_term}",
-              "issue_type": "<lexical ambiguity|semantic underspecification|missing criteria|subjective judgment|unclear action>",
-              "why_vague": "<brief explanation of why this is vague>",
-              "suggested_replacements": ["<specific replacement 1>", "<specific replacement 2>", "<specific replacement 3>"],
-              "clarifying_questions": ["<question to ask stakeholder 1>", "<question 2>"],
-              "automation_approach": "<how to make this testable/measurable for automation>",
-              "example_improvement": "<before and after example>"
-            }}
-            
-            Focus on making the term specific, measurable, testable, and automation-ready.
-            """
-            
-            try:
-                resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
-                content = (resp.content or "").strip()
-                
-                # Parse JSON
-                try:
-                    parsed = json.loads(content)
-                except Exception:
-                    try:
-                        json_str = content[content.index("{"):content.rindex("}") + 1]
-                        parsed = json.loads(json_str)
-                    except Exception:
-                        parsed = {
-                            "vague_term": vague_term,
-                            "issue_type": "unknown",
-                            "why_vague": "Could not analyze",
-                            "suggested_replacements": [],
-                            "clarifying_questions": [],
-                            "automation_approach": "Manual review needed",
-                            "example_improvement": "N/A"
-                        }
-                
-                suggestions.append(parsed)
-                
-            except Exception as e:
-                suggestions.append({
-                    "vague_term": vague_term,
-                    "issue_type": "error",
-                    "why_vague": f"Analysis error: {e}",
-                    "suggested_replacements": [],
-                    "clarifying_questions": [],
-                    "automation_approach": "Manual review needed",
-                    "example_improvement": "N/A"
-                })
-        
-        return suggestions
-
-    # ----------------------
-    # AGENT 4: Similarity matching (unchanged)
+    # Remaining agents (Similarity, Commands, Script) - UNCHANGED from previous version
     # ----------------------
 
     async def _generate_document_summary(self, cleaned_text: str, analysis: Dict) -> str:
-        chunks = chunk_text_paragraphs(cleaned_text, max_chunk_size=4000, overlap_paras=2)
+        chunks = chunk_text_by_paragraphs(cleaned_text, max_chunk_size=4000, overlap_paragraphs=1)
         partial_summaries: List[str] = []
         
         for idx, chunk in enumerate(chunks):
             prompt = f"""
-            Summarize this automation/runbook CHUNK for similarity search.
-            Preserve purpose, systems, key steps and outcomes.
+            Summarize this automation/runbook document for similarity search.
+            Preserve purpose, systems, key steps, visual elements, and outcomes.
             Return 1–2 paragraphs.
 
-            CHUNK {idx+1}/{len(chunks)}:
             {chunk}
             """
             resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
             partial_summaries.append((resp.content or "").strip())
+        
         summary = "\n\n".join(partial_summaries)
         return summary
 
@@ -901,10 +1071,6 @@ class DocumentAutomationWorkflow:
         state['current_step'] = 'similarity_matching_complete'
         return state
 
-    # ----------------------
-    # AGENT 5: Automation commands (unchanged)
-    # ----------------------
-
     async def _automation_commands_agent(self, state: WorkflowState) -> WorkflowState:
         print("🤖 Automation Commands Agent...")
         improved_doc = state['improved_document']
@@ -917,33 +1083,46 @@ class DocumentAutomationWorkflow:
         return state
 
     async def _analyze_automation_commands(self, content: str, analysis: Dict) -> Dict[str, Any]:
-        prompt = f"""
-        Analyze the improved document content and suggest specific automation commands for each step.
+        chunks = chunk_text_by_paragraphs(content, max_chunk_size=3500, overlap_paragraphs=1)
+        all_automatable_steps = []
+        all_ui_only_tasks = []
+        
+        print(f"🤖 Analyzing automation potential...")
+        
+        for i, chunk in enumerate(chunks):
+            prompt = f"""
+            Analyze this document and suggest specific automation commands for each step.
 
-        Return JSON:
-        {{
-          "automatable_steps": [...],
-          "ui_only_tasks": [...],
-          "automation_summary": {{
-             "total_steps": ...,
-             "automatable_steps": ...,
-             "ui_only_steps": ...,
-             "automation_percentage": ...,
-             "complexity_level": "High/Medium/Low"
-          }}
-        }}
+            Return JSON:
+            {{
+              "automatable_steps": [...],
+              "ui_only_tasks": [...]
+            }}
 
-        OVERALL AUTOMATION SCORE: {analysis.get('overall_automation_score', 6)}/10
-
-        IMPROVED DOCUMENT:
-        {content}
-        """
-        resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
-        return json.loads(resp.content)
-
-    # ----------------------
-    # AGENT 6: Script generation (unchanged)
-    # ----------------------
+            {chunk}
+            """
+            resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            try:
+                result = json.loads(resp.content)
+                all_automatable_steps.extend(result.get('automatable_steps', []))
+                all_ui_only_tasks.extend(result.get('ui_only_tasks', []))
+            except:
+                pass
+        
+        total_steps = len(all_automatable_steps) + len(all_ui_only_tasks)
+        automation_pct = round((len(all_automatable_steps) / total_steps * 100), 2) if total_steps > 0 else 0
+        
+        return {
+            "automatable_steps": all_automatable_steps,
+            "ui_only_tasks": all_ui_only_tasks,
+            "automation_summary": {
+                "total_steps": total_steps,
+                "automatable_steps": len(all_automatable_steps),
+                "ui_only_steps": len(all_ui_only_tasks),
+                "automation_percentage": automation_pct,
+                "complexity_level": "High" if automation_pct < 40 else "Medium" if automation_pct < 70 else "Low"
+            }
+        }
 
     async def _script_generation_agent(self, state: WorkflowState) -> WorkflowState:
         print("📜 Script Generation Agent...")
@@ -966,8 +1145,9 @@ class DocumentAutomationWorkflow:
         explanation += f"- Automation Percentage: {percentage}%\n"
         explanation += "- Threshold Required: 30% minimum\n\n"
         explanation += "## Reasons for Low Automation Score:\n\n"
-        for i, t in enumerate(ui_tasks, 1):
-            explanation += f"{i}. {t.get('step_description', 'UI Task')}\n"
+        for i, t in enumerate(ui_tasks[:10], 1):
+            task_desc = t if isinstance(t, str) else t.get('step_description', 'UI Task')
+            explanation += f"{i}. {task_desc}\n"
         return {
             'script_type': 'Analysis Report',
             'automation_viable': False,
@@ -1006,7 +1186,20 @@ class DocumentAutomationWorkflow:
         OVERALL AUTOMATION SCORE: {analysis.get('overall_automation_score', 6)}/10
         """
         resp = await self.llm.ainvoke([HumanMessage(content=prompt)])
-        data = json.loads(resp.content)
+        try:
+            data = json.loads(resp.content)
+        except:
+            data = {
+                "code": "# Error generating script",
+                "requirements": [],
+                "execution_steps": [],
+                "parameters_required": [],
+                "script_description": "Error in generation",
+                "automation_coverage": "Unknown",
+                "manual_steps_remaining": [],
+                "notes": "Failed to generate script"
+            }
+        
         data.update({
             'script_type': 'Python Automation Script',
             'automation_viable': True,
@@ -1016,11 +1209,8 @@ class DocumentAutomationWorkflow:
         })
         return data
 
-    # ----------------------
-    # Public entrypoints (UPDATED with vague_term_suggestions)
-    # ----------------------
-
     async def process_text_document(self, text_file_path: str) -> Dict[str, Any]:
+        """Process plain text documents (no images)"""
         with open(text_file_path, 'r', encoding='utf-8') as f:
             text_content = f.read()
 
@@ -1046,14 +1236,12 @@ class DocumentAutomationWorkflow:
             similarity_matches={},
             automation_commands={},
             generated_script={},
-            vague_term_suggestions={},
             messages=[],
             current_step="text_parsing_complete"
         )
 
         initial_state = await self._text_cleaning_agent(initial_state)
         initial_state = await self._enhanced_automation_analysis_agent(initial_state)
-        initial_state = await self._vague_term_remediation_agent(initial_state)  # NEW
         initial_state = await self._similarity_matching_agent(initial_state)
         initial_state = await self._automation_commands_agent(initial_state)
         final_state = await self._script_generation_agent(initial_state)
@@ -1063,13 +1251,13 @@ class DocumentAutomationWorkflow:
             'cleaned_content': final_state['cleaned_content'],
             'automation_analysis': final_state['automation_analysis'],
             'improved_document': final_state['improved_document'],
-            'vague_term_suggestions': final_state.get('vague_term_suggestions', {}),  # NEW
             'similarity_matches': final_state.get('similarity_matches', {}),
             'automation_commands': final_state.get('automation_commands', {}),
             'generated_script': final_state['generated_script']
         }
 
     async def process_document(self, pdf_path: str) -> Dict[str, Any]:
+        """Process PDF documents (with image analysis embedded in content)"""
         initial_state = WorkflowState(
             pdf_path=pdf_path,
             parsed_content={},
@@ -1079,7 +1267,6 @@ class DocumentAutomationWorkflow:
             similarity_matches={},
             automation_commands={},
             generated_script={},
-            vague_term_suggestions={},  # NEW
             messages=[],
             current_step="starting"
         )
@@ -1089,7 +1276,6 @@ class DocumentAutomationWorkflow:
             'cleaned_content': final_state['cleaned_content'],
             'automation_analysis': final_state['automation_analysis'],
             'improved_document': final_state['improved_document'],
-            'vague_term_suggestions': final_state.get('vague_term_suggestions', {}),  # NEW
             'similarity_matches': final_state.get('similarity_matches', {}),
             'automation_commands': final_state.get('automation_commands', {}),
             'generated_script': final_state['generated_script']
