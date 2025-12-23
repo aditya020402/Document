@@ -1,176 +1,325 @@
 import streamlit as st
-import asyncio
-import json
-from pathlib import Path
-import tempfile
-from typing import Dict, Any
+import sqlite3
 import pandas as pd
-
-from streamlit_pdf_viewer import pdf_viewer
-from document_automation_workflow import DocumentAutomationWorkflow
+from datetime import datetime
+from pathlib import Path
 
 st.set_page_config(
-    page_title="Document Automation Analyzer",
-    page_icon="📄",
+    page_title="Token Usage Analytics",
+    page_icon="📊",
     layout="wide"
 )
 
-st.title("📄 Document Automation Analyzer")
+st.title("📊 Token Usage Analytics Dashboard")
+st.markdown("Real-time analytics of AI token consumption across all document analyses")
 
-# Add link to analytics dashboard
-st.markdown("""
-Upload a document to analyze automation readiness or improve content quality.  
-📊 **[View Token Analytics Dashboard](http://localhost:8502)** (Run: `streamlit run token_analytics_dashboard.py --server.port 8502`)
-""")
+# Database path
+DB_PATH = "token_usage.db"
 
-# Initialize session state
-if 'results' not in st.session_state:
-    st.session_state.results = None
-if 'input_mode' not in st.session_state:
-    st.session_state.input_mode = 'pdf'
-if 'processing' not in st.session_state:
-    st.session_state.processing = False
-if 'workflow_mode' not in st.session_state:
-    st.session_state.workflow_mode = 'full_automation'
+def get_db_connection():
+    """Get SQLite database connection"""
+    return sqlite3.connect(DB_PATH)
 
-# DB CONFIG
-DB_CONFIG = {
-    'dbname': 'automation_db',
-    'user': 'your_username',
-    'password': 'your_password',
-    'host': 'localhost',
-    'port': '5432'
-}
+def fetch_all_sessions():
+    """Fetch all token usage sessions"""
+    conn = get_db_connection()
+    query = """
+        SELECT 
+            id,
+            document_name,
+            workflow_mode,
+            analysis_timestamp,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            analysis_duration_seconds,
+            document_size_chars,
+            document_pages,
+            total_images,
+            status,
+            error_message
+        FROM token_usage
+        ORDER BY analysis_timestamp DESC
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
 
-AZURE_EMBEDDING_CONFIG = {
-    'api_key': 'your-azure-api-key',
-    'api_version': '2023-05-15',
-    'endpoint': 'https://your-resource.openai.azure.com/',
-    'embedding_deployment': 'text-embedding-ada-002'
-}
+def fetch_agent_breakdown(session_id: int):
+    """Fetch agent-level token breakdown for a session"""
+    conn = get_db_connection()
+    query = """
+        SELECT 
+            agent_name,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            call_count
+        FROM agent_token_usage
+        WHERE session_id = ?
+        ORDER BY total_tokens DESC
+    """
+    df = pd.read_sql_query(query, conn, params=(session_id,))
+    conn.close()
+    return df
+
+def fetch_summary_stats():
+    """Fetch summary statistics"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Overall stats
+    cursor.execute("""
+        SELECT 
+            COUNT(*) as total_sessions,
+            COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_sessions,
+            COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_sessions,
+            SUM(total_tokens) as total_tokens,
+            SUM(prompt_tokens) as total_prompt_tokens,
+            SUM(completion_tokens) as total_completion_tokens,
+            AVG(total_tokens) as avg_tokens_per_session,
+            SUM(analysis_duration_seconds) as total_analysis_time,
+            AVG(analysis_duration_seconds) as avg_analysis_time
+        FROM token_usage
+    """)
+    
+    overall = cursor.fetchone()
+    
+    # Workflow mode breakdown
+    cursor.execute("""
+        SELECT 
+            workflow_mode,
+            COUNT(*) as session_count,
+            SUM(total_tokens) as total_tokens,
+            AVG(total_tokens) as avg_tokens,
+            SUM(analysis_duration_seconds) as total_duration
+        FROM token_usage
+        WHERE status = 'completed'
+        GROUP BY workflow_mode
+    """)
+    
+    workflow_stats = cursor.fetchall()
+    
+    conn.close()
+    
+    return {
+        'overall': overall,
+        'workflow_stats': workflow_stats
+    }
+
+def fetch_top_agents():
+    """Fetch top agents by token usage across all sessions"""
+    conn = get_db_connection()
+    query = """
+        SELECT 
+            agent_name,
+            SUM(total_tokens) as total_tokens,
+            SUM(prompt_tokens) as total_prompt_tokens,
+            SUM(completion_tokens) as total_completion_tokens,
+            SUM(call_count) as total_calls,
+            AVG(total_tokens) as avg_tokens_per_call
+        FROM agent_token_usage
+        GROUP BY agent_name
+        ORDER BY total_tokens DESC
+        LIMIT 10
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
 
 # ----------------------
-# Workflow Mode Selector
+# Refresh Button
 # ----------------------
 
-st.markdown("### 🎯 Select Analysis Mode")
-col1, col2 = st.columns(2)
+col_refresh, col_export = st.columns([1, 5])
 
-with col1:
-    if st.button(
-        "🤖 Full Automation Analysis", 
-        use_container_width=True,
-        type="primary" if st.session_state.workflow_mode == 'full_automation' else "secondary"
-    ):
-        st.session_state.workflow_mode = 'full_automation'
+with col_refresh:
+    if st.button("🔄 Refresh Data", use_container_width=True, type="primary"):
+        st.rerun()
 
-with col2:
-    if st.button(
-        "📝 Content Quality Improvement", 
-        use_container_width=True,
-        type="primary" if st.session_state.workflow_mode == 'content_improvement' else "secondary"
-    ):
-        st.session_state.workflow_mode = 'content_improvement'
-
-if st.session_state.workflow_mode == 'full_automation':
-    st.info("**Full Automation Analysis**: Analyzes automation readiness, finds similar automations, generates scripts.")
-else:
-    st.success("**Content Quality Improvement**: Focuses on clarity, completeness, readability, and consistency.")
+with col_export:
+    if st.button("📥 Export All Data to CSV", use_container_width=True):
+        conn = get_db_connection()
+        df_export = pd.read_sql_query("SELECT * FROM token_usage ORDER BY analysis_timestamp DESC", conn)
+        conn.close()
+        
+        csv_data = df_export.to_csv(index=False)
+        st.download_button(
+            label="⬇️ Download CSV",
+            data=csv_data,
+            file_name=f"token_usage_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
 
 st.divider()
 
 # ----------------------
-# Input selection
+# Summary Statistics
 # ----------------------
 
-st.markdown("### Choose Input Method")
-input_mode = st.radio(
-    "Select input method:",
-    options=['Upload PDF File', 'Paste/Type Text'],
-    horizontal=True
-)
+st.markdown("## 📈 Overall Statistics")
 
-uploaded_file = None
-text_input = None
-tmp_file_path = None
+stats = fetch_summary_stats()
+overall = stats['overall']
 
-if input_mode == 'Upload PDF File':
-    st.markdown("### 📤 Upload PDF Document")
-    uploaded_file = st.file_uploader("Choose a PDF file", type=['pdf'])
+col1, col2, col3, col4, col5 = st.columns(5)
+
+with col1:
+    st.metric("Total Sessions", f"{overall[0]:,}" if overall[0] else "0")
+with col2:
+    st.metric("✅ Completed", f"{overall[1]:,}" if overall[1] else "0")
+with col3:
+    st.metric("❌ Failed", f"{overall[2]:,}" if overall[2] else "0")
+with col4:
+    st.metric("Total Tokens Used", f"{overall[3]:,}" if overall[3] else "0")
+with col5:
+    st.metric("Avg Tokens/Session", f"{overall[6]:,.0f}" if overall[6] else "0")
+
+st.divider()
+
+# ----------------------
+# Workflow Mode Breakdown
+# ----------------------
+
+st.markdown("## 🎯 Token Usage by Workflow Mode")
+
+if stats['workflow_stats']:
+    workflow_data = []
+    for row in stats['workflow_stats']:
+        workflow_data.append({
+            "Workflow Mode": row[0],
+            "Sessions": row[1],
+            "Total Tokens": f"{row[2]:,}",
+            "Avg Tokens": f"{row[3]:,.0f}",
+            "Total Duration (s)": f"{row[4]:,.1f}"
+        })
     
-    if uploaded_file is not None:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_file_path = tmp_file.name
+    df_workflow = pd.DataFrame(workflow_data)
+    st.dataframe(df_workflow, use_container_width=True, hide_index=True)
+else:
+    st.info("No workflow data available yet")
+
+st.divider()
+
+# ----------------------
+# Top Agents by Token Usage
+# ----------------------
+
+st.markdown("## 🤖 Top Agents by Token Consumption")
+
+df_agents = fetch_top_agents()
+
+if not df_agents.empty:
+    df_agents['total_tokens'] = df_agents['total_tokens'].apply(lambda x: f"{x:,}")
+    df_agents['total_prompt_tokens'] = df_agents['total_prompt_tokens'].apply(lambda x: f"{x:,}")
+    df_agents['total_completion_tokens'] = df_agents['total_completion_tokens'].apply(lambda x: f"{x:,}")
+    df_agents['total_calls'] = df_agents['total_calls'].apply(lambda x: f"{x:,}")
+    df_agents['avg_tokens_per_call'] = df_agents['avg_tokens_per_call'].apply(lambda x: f"{x:,.1f}")
+    
+    df_agents.columns = ["Agent Name", "Total Tokens", "Prompt Tokens", "Completion Tokens", "Total Calls", "Avg Tokens/Call"]
+    
+    st.dataframe(df_agents, use_container_width=True, hide_index=True)
+else:
+    st.info("No agent data available yet")
+
+st.divider()
+
+# ----------------------
+# All Sessions Table
+# ----------------------
+
+st.markdown("## 📋 All Analysis Sessions")
+
+df_sessions = fetch_all_sessions()
+
+if not df_sessions.empty:
+    # Format the dataframe
+    df_sessions['analysis_timestamp'] = pd.to_datetime(df_sessions['analysis_timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
+    df_sessions['total_tokens'] = df_sessions['total_tokens'].apply(lambda x: f"{x:,}")
+    df_sessions['prompt_tokens'] = df_sessions['prompt_tokens'].apply(lambda x: f"{x:,}")
+    df_sessions['completion_tokens'] = df_sessions['completion_tokens'].apply(lambda x: f"{x:,}")
+    df_sessions['analysis_duration_seconds'] = df_sessions['analysis_duration_seconds'].apply(lambda x: f"{x:.2f}" if pd.notnull(x) else "N/A")
+    df_sessions['document_size_chars'] = df_sessions['document_size_chars'].apply(lambda x: f"{x:,}" if pd.notnull(x) else "0")
+    
+    # Rename columns for display
+    df_sessions.columns = [
+        "Session ID", "Document Name", "Workflow Mode", "Analysis Time", 
+        "Prompt Tokens", "Completion Tokens", "Total Tokens", 
+        "Duration (s)", "Doc Size (chars)", "Pages", "Images", "Status", "Error"
+    ]
+    
+    # Show dataframe with selection
+    st.dataframe(
+        df_sessions,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Status": st.column_config.TextColumn(
+                "Status",
+                help="Session status: completed or failed"
+            ),
+            "Error": st.column_config.TextColumn(
+                "Error Message",
+                help="Error message if failed"
+            )
+        }
+    )
+    
+    st.divider()
+    
+    # ----------------------
+    # Agent Breakdown for Selected Session
+    # ----------------------
+    
+    st.markdown("## 🔍 Agent Breakdown by Session")
+    
+    # Get original df for session IDs
+    df_sessions_raw = fetch_all_sessions()
+    session_ids = df_sessions_raw['id'].tolist()
+    session_names = [f"Session {sid} - {name}" for sid, name in zip(df_sessions_raw['id'], df_sessions_raw['document_name'])]
+    
+    selected_session_idx = st.selectbox(
+        "Select a session to view agent breakdown:",
+        range(len(session_ids)),
+        format_func=lambda i: session_names[i]
+    )
+    
+    if selected_session_idx is not None:
+        selected_session_id = session_ids[selected_session_idx]
         
-        st.success(f"✅ File uploaded: **{uploaded_file.name}**")
-        st.markdown("#### 📄 Document Preview")
-        pdf_viewer(uploaded_file.getvalue(), width=700, height=400)
+        df_agent_breakdown = fetch_agent_breakdown(selected_session_id)
+        
+        if not df_agent_breakdown.empty:
+            st.markdown(f"### 🤖 Agent Token Breakdown for Session {selected_session_id}")
+            
+            # Format
+            df_agent_breakdown['prompt_tokens'] = df_agent_breakdown['prompt_tokens'].apply(lambda x: f"{x:,}")
+            df_agent_breakdown['completion_tokens'] = df_agent_breakdown['completion_tokens'].apply(lambda x: f"{x:,}")
+            df_agent_breakdown['total_tokens'] = df_agent_breakdown['total_tokens'].apply(lambda x: f"{x:,}")
+            df_agent_breakdown['call_count'] = df_agent_breakdown['call_count'].apply(lambda x: f"{x:,}")
+            
+            df_agent_breakdown.columns = ["Agent Name", "Prompt Tokens", "Completion Tokens", "Total Tokens", "API Calls"]
+            
+            st.dataframe(df_agent_breakdown, use_container_width=True, hide_index=True)
+        else:
+            st.info(f"No agent breakdown available for Session {selected_session_id}")
 
 else:
-    st.markdown("### 📝 Paste or Type Your Document")
-    text_input = st.text_area("Paste content here", height=400, placeholder="Paste your document...")
-    
-    if text_input and len(text_input.strip()) >= 50:
-        word_count = len(text_input.split())
-        char_count = len(text_input)
-        
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Characters", f"{char_count:,}")
-        with c2:
-            st.metric("Words", f"{word_count:,}")
-        with c3:
-            st.metric("Lines", len(text_input.split('\n')))
-        
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', encoding='utf-8') as tmp_file:
-            tmp_file.write(text_input)
-            tmp_file_path = tmp_file.name
-        
-        st.success(f"✅ Text ready ({word_count} words)")
+    st.info("📭 No analysis sessions found. Process some documents first!")
+
+st.divider()
 
 # ----------------------
-# Process Button
+# Footer
 # ----------------------
 
-if ((input_mode == 'Upload PDF File' and uploaded_file) or 
-    (input_mode == 'Paste/Type Text' and text_input and len(text_input.strip()) >= 50)):
-    
-    label = "🤖 Analyze for Automation" if st.session_state.workflow_mode == 'full_automation' else "📝 Analyze Content Quality"
-    
-    if st.button(label, type="primary", use_container_width=True):
-        with st.spinner(f"🔄 Processing..."):
-            try:
-                workflow = DocumentAutomationWorkflow(
-                    db_config=DB_CONFIG,
-                    azure_embedding_config=AZURE_EMBEDDING_CONFIG
-                )
-                
-                if input_mode == 'Upload PDF File':
-                    results = asyncio.run(workflow.process_document(tmp_file_path, st.session_state.workflow_mode))
-                else:
-                    results = asyncio.run(workflow.process_text_document(tmp_file_path, st.session_state.workflow_mode))
-                
-                st.session_state.results = results
-                st.success("✅ Analysis complete!")
-                
-                # Show token usage just for this session
-                token_usage = results.get('token_usage', {})
-                if token_usage.get('session_id'):
-                    st.info(f"📊 **Session ID: {token_usage['session_id']}** | Tokens Used: **{token_usage.get('total_tokens', 0):,}** | [View Analytics Dashboard](http://localhost:8502)")
-                
-                st.rerun()
-                
-            except Exception as e:
-                st.error(f"❌ Error: {str(e)}")
-
-# ----------------------
-# Results Display (Keep all your existing tabs)
-# ----------------------
-
-if st.session_state.results:
-    results = st.session_state.results
-    workflow_mode = results.get('workflow_mode', 'full_automation')
-    
-    # ... [Keep all your existing tab code from previous version] ...
-    # Just remove the "Session Summary" section with token metrics
+st.markdown("---")
+st.markdown(
+    """
+    <div style='text-align: center; color: gray;'>
+    <p>Token Usage Analytics Dashboard | Data stored in <code>token_usage.db</code></p>
+    <p>Click <strong>Refresh Data</strong> to update with latest analysis results</p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
