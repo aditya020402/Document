@@ -1746,3 +1746,189 @@ class DocumentAutomationWorkflow:
 
 
 
+
+
+
+
+
+
+async def process_document(self, pdf_path: str, workflow_mode: str = 'full_automation') -> Dict[str, Any]:
+    """Process PDF with token tracking"""
+    
+    # Start token tracking
+    document_name = Path(pdf_path).name
+    
+    try:
+        doc = fitz.open(pdf_path)
+        document_pages = len(doc)
+        doc.close()
+        
+        with open(pdf_path, 'rb') as f:
+            document_size = len(f.read())
+        
+        doc = fitz.open(pdf_path)
+        total_images = sum(len(page.get_images()) for page in doc)
+        doc.close()
+        
+    except Exception as e:
+        print(f"⚠️ Error getting document metadata: {e}")
+        document_pages = 0
+        document_size = 0
+        total_images = 0
+    
+    self.token_tracker.start_session(
+        document_name=document_name,
+        workflow_mode=workflow_mode,
+        document_size=document_size,
+        document_pages=document_pages,
+        total_images=total_images
+    )
+    
+    try:
+        initial_state = WorkflowState(
+            pdf_path=pdf_path,
+            parsed_content={},
+            cleaned_content={},
+            automation_analysis={},
+            improved_document={},
+            similarity_matches={},
+            automation_commands={},
+            generated_script={},
+            messages=[],
+            current_step="starting",
+            workflow_mode=workflow_mode
+        )
+        
+        if workflow_mode == 'content_improvement':
+            final_state = await self.content_workflow.ainvoke(initial_state)
+        else:
+            final_state = await self.full_workflow.ainvoke(initial_state)
+        
+        # NEW: Capture token info BEFORE ending session
+        token_summary = {
+            'total_tokens': self.token_tracker.current_session_tokens['total_tokens'],
+            'prompt_tokens': self.token_tracker.current_session_tokens['prompt_tokens'],
+            'completion_tokens': self.token_tracker.current_session_tokens['completion_tokens'],
+            'agent_breakdown': self.token_tracker.agent_tokens.copy()
+        }
+        
+        # End session and get session_id
+        session_id = self.token_tracker.end_session(status="completed")
+        
+        # Add session_id to token summary
+        token_summary['session_id'] = session_id
+        
+        return {
+            'parsed_content': final_state['parsed_content'],
+            'cleaned_content': final_state['cleaned_content'],
+            'automation_analysis': final_state['automation_analysis'],
+            'improved_document': final_state['improved_document'],
+            'similarity_matches': final_state.get('similarity_matches', {}),
+            'automation_commands': final_state.get('automation_commands', {}),
+            'generated_script': final_state['generated_script'],
+            'workflow_mode': workflow_mode,
+            'token_usage': token_summary  # NOW INCLUDES ALL DATA
+        }
+        
+    except Exception as e:
+        # Capture before ending failed session
+        token_summary = {
+            'total_tokens': self.token_tracker.current_session_tokens.get('total_tokens', 0),
+            'prompt_tokens': self.token_tracker.current_session_tokens.get('prompt_tokens', 0),
+            'completion_tokens': self.token_tracker.current_session_tokens.get('completion_tokens', 0),
+            'agent_breakdown': self.token_tracker.agent_tokens.copy()
+        }
+        
+        session_id = self.token_tracker.end_session(status="failed", error_message=str(e))
+        token_summary['session_id'] = session_id
+        
+        # Re-raise with token info attached
+        raise e
+
+
+async def process_text_document(self, text_file_path: str, workflow_mode: str = 'full_automation') -> Dict[str, Any]:
+    """Process text with token tracking"""
+    with open(text_file_path, 'r', encoding='utf-8') as f:
+        text_content = f.read()
+    
+    document_name = Path(text_file_path).name
+    self.token_tracker.start_session(
+        document_name=document_name,
+        workflow_mode=workflow_mode,
+        document_size=len(text_content),
+        document_pages=1,
+        total_images=0
+    )
+    
+    try:
+        initial_state = WorkflowState(
+            pdf_path=text_file_path,
+            parsed_content={
+                'combined_text': text_content,
+                'page_breakdown': [],
+                'total_pages': 1,
+                'processing_summary': {
+                    'total_text_length': len(text_content),
+                    'pages_with_images': 0,
+                    'total_images': 0,
+                    'pages_with_multimodal_content': 0,
+                    'image_analysis_count': 0,
+                    'input_type': 'text'
+                },
+                'image_analysis': []
+            },
+            cleaned_content={},
+            automation_analysis={},
+            improved_document={},
+            similarity_matches={},
+            automation_commands={},
+            generated_script={},
+            messages=[],
+            current_step="text_parsing_complete",
+            workflow_mode=workflow_mode
+        )
+
+        initial_state = await self._text_cleaning_agent(initial_state)
+        
+        if workflow_mode == 'content_improvement':
+            initial_state = await self._content_quality_scoring_agent(initial_state)
+            initial_state = await self._content_improvement_agent(initial_state)
+        else:
+            initial_state = await self._enhanced_automation_analysis_agent(initial_state)
+            initial_state = await self._similarity_matching_agent(initial_state)
+            initial_state = await self._automation_commands_agent(initial_state)
+            initial_state = await self._script_generation_agent(initial_state)
+
+        # NEW: Capture token info BEFORE ending
+        token_summary = {
+            'total_tokens': self.token_tracker.current_session_tokens['total_tokens'],
+            'prompt_tokens': self.token_tracker.current_session_tokens['prompt_tokens'],
+            'completion_tokens': self.token_tracker.current_session_tokens['completion_tokens'],
+            'agent_breakdown': self.token_tracker.agent_tokens.copy()
+        }
+        
+        session_id = self.token_tracker.end_session(status="completed")
+        token_summary['session_id'] = session_id
+
+        return {
+            'parsed_content': initial_state['parsed_content'],
+            'cleaned_content': initial_state['cleaned_content'],
+            'automation_analysis': initial_state['automation_analysis'],
+            'improved_document': initial_state['improved_document'],
+            'similarity_matches': initial_state.get('similarity_matches', {}),
+            'automation_commands': initial_state.get('automation_commands', {}),
+            'generated_script': initial_state['generated_script'],
+            'workflow_mode': workflow_mode,
+            'token_usage': token_summary  # NOW INCLUDES ALL DATA
+        }
+        
+    except Exception as e:
+        token_summary = {
+            'total_tokens': self.token_tracker.current_session_tokens.get('total_tokens', 0),
+            'prompt_tokens': self.token_tracker.current_session_tokens.get('prompt_tokens', 0),
+            'completion_tokens': self.token_tracker.current_session_tokens.get('completion_tokens', 0),
+            'agent_breakdown': self.token_tracker.agent_tokens.copy()
+        }
+        session_id = self.token_tracker.end_session(status="failed", error_message=str(e))
+        token_summary['session_id'] = session_id
+        raise e
