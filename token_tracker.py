@@ -10,6 +10,10 @@ class TokenTracker:
     Tracks token usage across document analysis workflows and stores in SQLite database.
     """
     
+    # Token pricing (per 1000 tokens)
+    INPUT_TOKEN_COST_PER_1K = 0.0012  # $0.0012 per 1K input tokens
+    OUTPUT_TOKEN_COST_PER_1K = 0.0050  # $0.0050 per 1K output tokens
+    
     def __init__(self, db_path: str = "token_usage.db"):
         self.db_path = db_path
         
@@ -22,6 +26,9 @@ class TokenTracker:
         
         # CRITICAL: Initialize agent_tokens dictionary
         self.agent_tokens = {}
+        
+        # Initialize cost tracking
+        self.current_session_cost = 0.0
         
         # Session metadata
         self.current_document_name = None
@@ -92,6 +99,27 @@ class TokenTracker:
         
         print(f"✅ Token tracking database initialized at: {self.db_path}")
     
+    def calculate_cost(self, prompt_tokens: int, completion_tokens: int) -> Dict[str, float]:
+        """
+        Calculate cost based on token usage.
+        
+        Args:
+            prompt_tokens: Number of input/prompt tokens
+            completion_tokens: Number of output/completion tokens
+        
+        Returns:
+            Dictionary with cost breakdown
+        """
+        input_cost = (prompt_tokens / 1000) * self.INPUT_TOKEN_COST_PER_1K
+        output_cost = (completion_tokens / 1000) * self.OUTPUT_TOKEN_COST_PER_1K
+        total_cost = input_cost + output_cost
+        
+        return {
+            'input_cost_usd': round(input_cost, 6),
+            'output_cost_usd': round(output_cost, 6),
+            'total_cost_usd': round(total_cost, 6)
+        }
+    
     def start_session(self, document_name: str, workflow_mode: str, 
                       document_size: int = 0, document_pages: int = 0, 
                       total_images: int = 0):
@@ -109,6 +137,9 @@ class TokenTracker:
             'document_pages': document_pages,
             'total_images': total_images
         }
+        
+        # Reset cost
+        self.current_session_cost = 0.0
         
         # CRITICAL: Reset agent tokens to empty dictionary
         self.agent_tokens = {}
@@ -141,6 +172,10 @@ class TokenTracker:
                 print(f"⚠️ Could not extract token usage from response for {agent_name}")
                 return
             
+            # Calculate cost for this call
+            call_cost = self.calculate_cost(prompt_tokens, completion_tokens)
+            self.current_session_cost += call_cost['total_cost_usd']
+            
             # Aggregate tokens for session
             self.current_session_tokens['prompt_tokens'] += prompt_tokens
             self.current_session_tokens['completion_tokens'] += completion_tokens
@@ -156,15 +191,17 @@ class TokenTracker:
                     'prompt_tokens': 0,
                     'completion_tokens': 0,
                     'total_tokens': 0,
-                    'call_count': 0
+                    'call_count': 0,
+                    'total_cost_usd': 0.0
                 }
             
             self.agent_tokens[agent_name]['prompt_tokens'] += prompt_tokens
             self.agent_tokens[agent_name]['completion_tokens'] += completion_tokens
             self.agent_tokens[agent_name]['total_tokens'] += total_tokens
             self.agent_tokens[agent_name]['call_count'] += 1
+            self.agent_tokens[agent_name]['total_cost_usd'] += call_cost['total_cost_usd']
             
-            print(f"  🔢 {agent_name}: +{total_tokens} tokens (prompt: {prompt_tokens}, completion: {completion_tokens})")
+            print(f"  🔢 {agent_name}: +{total_tokens} tokens (prompt: {prompt_tokens}, completion: {completion_tokens}) | Cost: ${call_cost['total_cost_usd']:.6f}")
             
         except Exception as e:
             print(f"⚠️ Error tracking tokens for {agent_name}: {e}")
@@ -233,9 +270,16 @@ class TokenTracker:
             
             conn.commit()
             
+            # Calculate final cost
+            final_cost = self.calculate_cost(
+                self.current_session_tokens['prompt_tokens'],
+                self.current_session_tokens['completion_tokens']
+            )
+            
             print(f"✅ Session ended. Total tokens used: {self.current_session_tokens['total_tokens']}")
             print(f"   Session ID: {session_id}")
             print(f"   Duration: {analysis_duration:.2f} seconds")
+            print(f"   💰 Total Cost: ${final_cost['total_cost_usd']:.6f}")
             
             # Store session_id before reset
             self.session_id = session_id
@@ -245,6 +289,7 @@ class TokenTracker:
             self.current_workflow_mode = None
             self.session_start_time = None
             self.agent_tokens = {}  # Reset to empty dict, not None
+            self.current_session_cost = 0.0
             
             return session_id
             
@@ -263,12 +308,20 @@ class TokenTracker:
         if not hasattr(self, 'agent_tokens') or self.agent_tokens is None:
             self.agent_tokens = {}
         
+        # Calculate session cost
+        session_cost = self.calculate_cost(
+            self.current_session_tokens['prompt_tokens'],
+            self.current_session_tokens['completion_tokens']
+        )
+        
         return {
             'document_name': self.current_document_name,
             'workflow_mode': self.current_workflow_mode,
             'tokens': self.current_session_tokens.copy(),
             'agent_breakdown': self.agent_tokens.copy() if self.agent_tokens else {},
-            'duration': (datetime.now() - self.session_start_time).total_seconds() if self.session_start_time else 0
+            'duration': (datetime.now() - self.session_start_time).total_seconds() if self.session_start_time else 0,
+            'cost_breakdown': session_cost,
+            'total_cost_usd': session_cost['total_cost_usd']
         }
     
     def get_total_usage(self) -> Dict[str, Any]:
@@ -291,13 +344,22 @@ class TokenTracker:
             
             result = cursor.fetchone()
             
+            # Calculate total cost
+            total_prompt = result[1] or 0
+            total_completion = result[2] or 0
+            cost_breakdown = self.calculate_cost(total_prompt, total_completion)
+            
             return {
                 'total_documents': result[0] or 0,
-                'total_prompt_tokens': result[1] or 0,
-                'total_completion_tokens': result[2] or 0,
+                'total_prompt_tokens': total_prompt,
+                'total_completion_tokens': total_completion,
                 'total_tokens': result[3] or 0,
                 'avg_tokens_per_document': round(result[4] or 0, 2),
-                'total_analysis_time_seconds': round(result[5] or 0, 2)
+                'total_analysis_time_seconds': round(result[5] or 0, 2),
+                'total_cost_usd': cost_breakdown['total_cost_usd'],
+                'total_input_cost_usd': cost_breakdown['input_cost_usd'],
+                'total_output_cost_usd': cost_breakdown['output_cost_usd'],
+                'avg_cost_per_document': round(cost_breakdown['total_cost_usd'] / (result[0] or 1), 4)
             }
         except Exception as e:
             print(f"❌ Error getting total usage: {e}")
@@ -307,7 +369,11 @@ class TokenTracker:
                 'total_completion_tokens': 0,
                 'total_tokens': 0,
                 'avg_tokens_per_document': 0,
-                'total_analysis_time_seconds': 0
+                'total_analysis_time_seconds': 0,
+                'total_cost_usd': 0.0,
+                'total_input_cost_usd': 0.0,
+                'total_output_cost_usd': 0.0,
+                'avg_cost_per_document': 0.0
             }
         finally:
             conn.close()
