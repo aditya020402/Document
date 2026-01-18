@@ -1,0 +1,526 @@
+import streamlit as st
+from pathlib import Path
+import base64
+
+# Page configuration
+st.set_page_config(
+    page_title="KAT - Knowledge Analysis Tool",
+    page_icon="🔍",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for UBS Red Theme
+def load_css():
+    st.markdown("""
+    <style>
+        /* UBS Red Color Scheme */
+        :root {
+            --ubs-red: #E60000;
+            --ubs-dark-red: #B30000;
+            --ubs-light-red: #FF4D4D;
+            --ubs-gray: #666666;
+            --ubs-light-gray: #F5F5F5;
+        }
+        
+        /* Main header styling */
+        .main-header {
+            background: linear-gradient(135deg, var(--ubs-red) 0%, var(--ubs-dark-red) 100%);
+            padding: 2rem;
+            border-radius: 10px;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        
+        .main-header h1 {
+            color: white;
+            margin: 0;
+            font-size: 2.5rem;
+            font-weight: 700;
+        }
+        
+        .main-header p {
+            color: white;
+            margin: 0.5rem 0 0 0;
+            font-size: 1.1rem;
+            opacity: 0.95;
+        }
+        
+        /* UBS Logo styling */
+        .ubs-logo {
+            display: flex;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        
+        .ubs-logo img {
+            height: 50px;
+            margin-right: 1rem;
+        }
+        
+        /* Sidebar styling */
+        .css-1d391kg {
+            background-color: var(--ubs-light-gray);
+        }
+        
+        /* Button styling */
+        .stButton>button {
+            background-color: var(--ubs-red);
+            color: white;
+            border: none;
+            border-radius: 5px;
+            padding: 0.5rem 2rem;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        
+        .stButton>button:hover {
+            background-color: var(--ubs-dark-red);
+            box-shadow: 0 4px 8px rgba(230,0,0,0.3);
+        }
+        
+        /* Metric cards */
+        .metric-card {
+            background: white;
+            border-left: 4px solid var(--ubs-red);
+            padding: 1rem;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 1rem;
+        }
+        
+        /* Info boxes */
+        .stAlert {
+            border-left: 4px solid var(--ubs-red);
+        }
+        
+        /* Tabs */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 2rem;
+        }
+        
+        .stTabs [data-baseweb="tab"] {
+            color: var(--ubs-gray);
+            font-weight: 600;
+        }
+        
+        .stTabs [aria-selected="true"] {
+            color: var(--ubs-red);
+            border-bottom: 2px solid var(--ubs-red);
+        }
+        
+        /* Footer styling */
+        .footer {
+            background-color: var(--ubs-light-gray);
+            border-top: 3px solid var(--ubs-red);
+            padding: 2rem;
+            margin-top: 3rem;
+            text-align: center;
+        }
+        
+        .footer-content {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        .footer-logo {
+            margin-bottom: 1rem;
+        }
+        
+        .footer-text {
+            color: var(--ubs-gray);
+            font-size: 0.9rem;
+            line-height: 1.6;
+        }
+        
+        .footer-team {
+            color: var(--ubs-red);
+            font-weight: 600;
+            margin-top: 0.5rem;
+        }
+        
+        /* Divider */
+        hr {
+            border: none;
+            border-top: 2px solid var(--ubs-red);
+            margin: 2rem 0;
+        }
+        
+        /* Upload area */
+        .uploadedFile {
+            border-left: 3px solid var(--ubs-red);
+        }
+        
+        /* Progress bar */
+        .stProgress > div > div > div > div {
+            background-color: var(--ubs-red);
+        }
+        
+        /* Expander */
+        .streamlit-expanderHeader {
+            background-color: var(--ubs-light-gray);
+            border-left: 3px solid var(--ubs-red);
+            font-weight: 600;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+# UBS Logo (you can replace with actual UBS logo URL or base64)
+def render_header():
+    st.markdown("""
+    <div class="main-header">
+        <div class="ubs-logo">
+            <svg width="50" height="50" viewBox="0 0 50 50" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <rect width="50" height="50" fill="white"/>
+                <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" 
+                      font-family="Arial" font-size="24" font-weight="bold" fill="#E60000">UBS</text>
+            </svg>
+        </div>
+        <h1>KAT - Knowledge Analysis Tool</h1>
+        <p>AI-Powered Document Automation & Content Quality Analysis</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Footer
+def render_footer():
+    st.markdown("""
+    <div class="footer">
+        <div class="footer-content">
+            <div class="footer-logo">
+                <svg width="60" height="60" viewBox="0 0 60 60" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <rect width="60" height="60" fill="#E60000" rx="5"/>
+                    <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" 
+                          font-family="Arial" font-size="28" font-weight="bold" fill="white">UBS</text>
+                </svg>
+            </div>
+            <div class="footer-text">
+                <strong>Knowledge Analysis Tool (KAT)</strong><br>
+                Developed by UBS Technology Innovation Team<br>
+                <div class="footer-team">
+                    AI Engineering & Automation Excellence Team<br>
+                    © 2026 UBS Group AG. All rights reserved.
+                </div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Load CSS
+load_css()
+
+# Render header
+render_header()
+
+# Import your existing workflow
+from document_automation_workflow import DocumentAutomationWorkflow
+from token_tracker import TokenTracker
+import asyncio
+import tempfile
+import json
+
+# Initialize
+DB_CONFIG = {
+    'dbname': 'automation_db',
+    'user': 'your_username',
+    'password': 'your_password',
+    'host': 'localhost',
+    'port': '5432'
+}
+
+AZURE_EMBEDDING_CONFIG = {
+    'api_key': 'your-azure-api-key',
+    'api_version': '2023-05-15',
+    'endpoint': 'https://your-resource.openai.azure.com/',
+    'embedding_deployment': 'text-embedding-ada-002'
+}
+
+@st.cache_resource
+def get_workflow():
+    return DocumentAutomationWorkflow(
+        db_config=DB_CONFIG,
+        azure_embedding_config=AZURE_EMBEDDING_CONFIG
+    )
+
+@st.cache_resource
+def get_token_tracker():
+    return TokenTracker()
+
+workflow = get_workflow()
+token_tracker = get_token_tracker()
+
+# Sidebar
+with st.sidebar:
+    st.markdown("""
+    <div style='text-align: center; padding: 1rem 0;'>
+        <svg width="80" height="80" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect width="80" height="80" fill="#E60000" rx="10"/>
+            <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" 
+                  font-family="Arial" font-size="36" font-weight="bold" fill="white">UBS</text>
+        </svg>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.title("Analysis Settings")
+    
+    workflow_mode = st.selectbox(
+        "Workflow Mode",
+        options=["full_automation", "content_improvement"],
+        format_func=lambda x: "Full Automation Analysis" if x == "full_automation" else "Content Quality Improvement"
+    )
+    
+    st.markdown("---")
+    
+    st.subheader("About KAT")
+    st.write("""
+    KAT analyzes technical documents and runbooks to:
+    
+    - Assess automation readiness
+    - Evaluate content quality
+    - Generate automation scripts
+    - Find similar documents
+    - Extract actionable commands
+    """)
+    
+    st.markdown("---")
+    
+    st.caption("Version 1.0.0")
+    st.caption("UBS Technology")
+
+# Main content
+tab1, tab2, tab3 = st.tabs(["Document Analysis", "Analysis Results", "Token Analytics"])
+
+with tab1:
+    st.subheader("Upload Document for Analysis")
+    
+    upload_method = st.radio(
+        "Select Input Method",
+        ["Upload PDF", "Enter Text"],
+        horizontal=True
+    )
+    
+    if upload_method == "Upload PDF":
+        uploaded_file = st.file_uploader(
+            "Choose a PDF file",
+            type=['pdf'],
+            help="Upload a runbook or technical document in PDF format"
+        )
+        
+        if uploaded_file is not None:
+            st.success(f"File uploaded: {uploaded_file.name}")
+            
+            if st.button("Analyze Document", type="primary", use_container_width=True):
+                with st.spinner("Processing document..."):
+                    try:
+                        # Save temp file
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                            tmp_file.write(uploaded_file.getvalue())
+                            tmp_file_path = tmp_file.name
+                        
+                        # Process
+                        results = asyncio.run(workflow.process_document(tmp_file_path, workflow_mode))
+                        
+                        # Store in session state
+                        st.session_state['analysis_results'] = results
+                        st.session_state['document_name'] = uploaded_file.name
+                        
+                        st.success("Analysis complete!")
+                        st.info("View results in the 'Analysis Results' tab")
+                        
+                        Path(tmp_file_path).unlink()
+                        
+                    except Exception as e:
+                        st.error(f"Error processing document: {str(e)}")
+    
+    else:
+        text_input = st.text_area(
+            "Enter document text",
+            height=300,
+            placeholder="Paste your runbook or document text here..."
+        )
+        
+        if text_input:
+            if st.button("Analyze Text", type="primary", use_container_width=True):
+                with st.spinner("Processing text..."):
+                    try:
+                        # Save temp file
+                        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', encoding='utf-8') as tmp_file:
+                            tmp_file.write(text_input)
+                            tmp_file_path = tmp_file.name
+                        
+                        # Process
+                        results = asyncio.run(workflow.process_text_document(tmp_file_path, workflow_mode))
+                        
+                        # Store in session state
+                        st.session_state['analysis_results'] = results
+                        st.session_state['document_name'] = "text_document.txt"
+                        
+                        st.success("Analysis complete!")
+                        st.info("View results in the 'Analysis Results' tab")
+                        
+                        Path(tmp_file_path).unlink()
+                        
+                    except Exception as e:
+                        st.error(f"Error processing text: {str(e)}")
+
+with tab2:
+    st.subheader("Analysis Results")
+    
+    if 'analysis_results' in st.session_state:
+        results = st.session_state['analysis_results']
+        doc_name = st.session_state.get('document_name', 'Unknown')
+        
+        st.markdown(f"**Document:** {doc_name}")
+        st.markdown(f"**Workflow Mode:** {results.get('workflow_mode', 'N/A')}")
+        
+        st.markdown("---")
+        
+        # Automation scores
+        if 'automation_analysis' in results and results['automation_analysis']:
+            analysis = results['automation_analysis']
+            
+            st.subheader("Automation Readiness Scores")
+            
+            scores = analysis.get('quality_scores', {})
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                clarity = scores.get('clarity_score', 0)
+                st.metric("Clarity Score", f"{clarity}/10")
+            
+            with col2:
+                determinism = scores.get('determinism_score', 0)
+                st.metric("Determinism Score", f"{determinism}/10")
+            
+            with col3:
+                logic = scores.get('logic_decision_score', 0)
+                st.metric("Logic Score", f"{logic}/10")
+            
+            with col4:
+                overall = scores.get('overall_automation_score', 0)
+                st.metric("Overall Score", f"{overall}/10")
+            
+            st.markdown("---")
+            
+            # Recommendations
+            if 'recommendations' in analysis:
+                st.subheader("Recommendations")
+                for rec in analysis['recommendations']:
+                    st.write(f"- {rec}")
+            
+            # Generated script
+            if 'generated_script' in results and results['generated_script']:
+                st.markdown("---")
+                st.subheader("Generated Automation Script")
+                script_data = results['generated_script']
+                
+                if 'script' in script_data:
+                    st.code(script_data['script'], language=script_data.get('language', 'bash'))
+                    
+                    st.download_button(
+                        "Download Script",
+                        data=script_data['script'],
+                        file_name=f"automation_script.{script_data.get('language', 'sh')}",
+                        mime="text/plain"
+                    )
+        
+        # Token usage
+        if 'token_usage' in results:
+            st.markdown("---")
+            st.subheader("Token Usage")
+            
+            token_data = results['token_usage']
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("Total Tokens", f"{token_data.get('total_tokens', 0):,}")
+            
+            with col2:
+                st.metric("Prompt Tokens", f"{token_data.get('prompt_tokens', 0):,}")
+            
+            with col3:
+                st.metric("Completion Tokens", f"{token_data.get('completion_tokens', 0):,}")
+            
+            with col4:
+                session_id = token_data.get('session_id', 'N/A')
+                st.metric("Session ID", session_id)
+        
+        # Download full results
+        st.markdown("---")
+        st.download_button(
+            "Download Full Results (JSON)",
+            data=json.dumps(results, indent=2),
+            file_name=f"kat_analysis_{doc_name}.json",
+            mime="application/json",
+            use_container_width=True
+        )
+    
+    else:
+        st.info("No analysis results available. Please analyze a document first.")
+
+with tab3:
+    st.subheader("Token Usage Analytics")
+    
+    if st.button("Refresh Statistics", use_container_width=True):
+        st.rerun()
+    
+    # Get statistics
+    stats = token_tracker.get_total_usage()
+    
+    st.markdown("### Overall Statistics")
+    
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        st.metric("Total Documents", f"{stats['total_documents']:,}")
+    
+    with col2:
+        st.metric("Total Tokens", f"{stats['total_tokens']:,}")
+    
+    with col3:
+        st.metric("Avg Tokens/Doc", f"{stats['avg_tokens_per_document']:,.0f}")
+    
+    with col4:
+        st.metric("Total Cost", f"${stats['total_cost_usd']:.4f}")
+    
+    with col5:
+        st.metric("Avg Cost/Doc", f"${stats['avg_cost_per_document']:.4f}")
+    
+    st.markdown("---")
+    
+    # Cost breakdown
+    st.subheader("Cost Breakdown")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("Input Cost", f"${stats['total_input_cost_usd']:.6f}")
+    
+    with col2:
+        st.metric("Output Cost", f"${stats['total_output_cost_usd']:.6f}")
+    
+    with col3:
+        total_time = stats['total_analysis_time_seconds']
+        st.metric("Total Time", f"{total_time:.1f}s")
+    
+    st.markdown("---")
+    
+    # Recent sessions
+    st.subheader("Recent Analysis Sessions")
+    
+    sessions = token_tracker.get_recent_sessions(limit=10)
+    
+    if sessions:
+        import pandas as pd
+        
+        df = pd.DataFrame(sessions)
+        df_display = df[['id', 'document_name', 'workflow_mode', 'total_tokens', 'analysis_duration_seconds', 'status']].copy()
+        df_display.columns = ['Session ID', 'Document', 'Workflow', 'Total Tokens', 'Duration (s)', 'Status']
+        
+        st.dataframe(df_display, use_container_width=True, hide_index=True)
+    else:
+        st.info("No sessions found.")
+
+# Render footer
+render_footer()
