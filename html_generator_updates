@@ -1,0 +1,49 @@
+# In the "Analysis Results" tab, after showing the results, add:
+
+        # Download full results
+        st.markdown("---")
+        
+        col_json, col_html = st.columns(2)
+        
+        with col_json:
+            st.download_button(
+                "Download Results (JSON)",
+                data=json.dumps(results, indent=2),
+                file_name=f"kat_analysis_{doc_name}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+        
+        with col_html:
+            if st.button("Generate HTML Report", use_container_width=True, type="primary"):
+                from html_generator import generate_html_report
+                
+                # Generate HTML
+                html_file = f"kat_report_{doc_name.replace('.pdf', '').replace('.txt', '')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+                html_content = generate_html_report(results, html_file)
+                
+                st.download_button(
+                    "Download HTML Report",
+                    data=html_content,
+                    file_name=html_file,
+                    mime="text/html",
+                    use_container_width=True
+                )
+                
+                st.success(f"HTML report generated: {html_file}")
+
+
+
+# In your process_document method, ensure parsed_content includes image paths:
+
+parsed_content = {
+    'raw_text': extracted_text,
+    'images': [
+        {
+            'path': img_path,
+            'page': page_num,
+            'index': idx
+        }
+        for idx, (img_path, page_num) in enumerate(extracted_images)
+    ]
+}
