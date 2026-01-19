@@ -185,95 +185,112 @@ class HTMLDocumentGenerator:
                 .replace("'", "&#39;"))
 
     def generate_html(self, analysis_results: Dict[str, Any], output_path: str | None = None) -> str:
-        from datetime import datetime
-        from pathlib import Path
+    from datetime import datetime
+    from pathlib import Path
+    import re
 
-        doc_name = analysis_results.get("document_name", "Document")
-        workflow_mode = analysis_results.get("workflow_mode", "unknown")
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    doc_name = analysis_results.get("document_name", "Document")
+    workflow_mode = analysis_results.get("workflow_mode", "unknown")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-        # 1) pick only improved content
-        improved_content = None
-        if isinstance(analysis_results.get("improved_document"), dict):
-            improved_content = analysis_results["improved_document"].get("improved_content")
-        if not improved_content and isinstance(analysis_results.get("cleaned_content"), dict):
-            improved_content = analysis_results["cleaned_content"].get("cleaned_text", "")
+    # 1) Get improved content
+    improved_content = None
+    if isinstance(analysis_results.get("improved_document"), dict):
+        improved_content = analysis_results["improved_document"].get("improved_content")
+    if not improved_content and isinstance(analysis_results.get("cleaned_content"), dict):
+        improved_content = analysis_results["cleaned_content"].get("cleaned_text", "")
 
-        text_blocks: list[str] = []
-        if isinstance(improved_content, str):
-            # split into logical blocks (paragraphs)
-            for block in improved_content.split("\n\n"):
-                if block.strip():
-                    text_blocks.append(block.strip())
-        else:
-            text_blocks.append(str(improved_content or ""))
+    if not improved_content:
+        improved_content = "No content available"
 
-        # 2) collect parsed images (paths only)
-        images = []
-        parsed = analysis_results.get("parsed_content") or {}
-        if isinstance(parsed, dict) and isinstance(parsed.get("images"), list):
-            for item in parsed["images"]:
-                if isinstance(item, dict) and "path" in item:
-                    images.append(item)
+    # 2) Build image lookup map: image_id -> metadata
+    image_map = {}
+    parsed = analysis_results.get("parsed_content") or {}
+    if isinstance(parsed, dict) and isinstance(parsed.get("images"), list):
+        for item in parsed["images"]:
+            if isinstance(item, dict) and "image_id" in item and "path" in item:
+                image_map[item["image_id"]] = item
 
-        # 3) build HTML
-        parts: list[str] = []
-        parts.append("<!DOCTYPE html><html><head><meta charset='utf-8'>")
-        parts.append(f"<title>{self._esc(doc_name)} - KAT</title>")
-        parts.append(self._get_css_styles())
-        parts.append("</head><body>")
-        parts.append('<div class="container">')
-
-        # header
-        parts.append("""
-        <div class="header">
-          <div class="header-logo">
-            <div class="header-logo-text">UBS</div>
-          </div>
-          <h1>Knowledge Analysis Tool (KAT)</h1>
-          <div class="subtitle">Final improved document</div>
+    # 3) Replace [IMAGE_X_Y_ANALYSIS] blocks with image + analysis
+    def replace_image_block(match):
+        image_id = match.group(1)  # IMAGE_2_1 from [IMAGE_2_1_ANALYSIS]
+        img_meta = image_map.get(image_id)
+        
+        if not img_meta or not Path(img_meta["path"]).exists():
+            return match.group(0)  # Keep original if image missing
+        
+        # Encode image
+        b64 = self._encode_image(img_meta["path"])
+        if not b64:
+            return match.group(0)
+        
+        page = img_meta.get("page", "N/A")
+        return f"""
+        <div class="image-analysis-container">
+            <div class="image-block">
+                <img src="data:image/png;base64,{b64}" alt="Image {image_id}">
+                <div class="image-caption">Page {page}</div>
+            </div>
+            <div class="analysis-details">
+                <span class="analysis-label">Description:</span><span>{self._esc(img_meta.get('image_description', 'N/A'))}</span><br>
+                <span class="analysis-label">Purpose:</span><span>{self._esc(img_meta.get('purpose', 'N/A'))}</span><br>
+                <span class="analysis-label">Relevance:</span><span>{self._esc(img_meta.get('automation_relevance', 'N/A'))}</span>
+            </div>
         </div>
-        """)
+        """
 
-        # content
-        parts.append('<div class="content">')
-        parts.append(f'<div class="doc-title">{self._esc(doc_name)}</div>')
-        parts.append(f'<div class="meta">Mode: {self._esc(workflow_mode)} · Generated: {self._esc(ts)}</div>')
+    # Replace IMAGE_ANALYSIS blocks (including everything until [END_IMAGE_X_Y_ANALYSIS])
+    content_with_images = re.sub(
+        r'\[([A-Z_]+_\d+_\d+)_ANALYSIS\](.*?)\[END_\1_ANALYSIS\]\s*',
+        replace_image_block,
+        improved_content,
+        flags=re.DOTALL | re.IGNORECASE
+    )
 
-        # improved content only
-        for block in text_blocks:
-            parts.append(self._classify_block(block))
+    # 4) Split remaining content into blocks for styling
+    text_blocks = []
+    for block in content_with_images.split("\n\n"):
+        if block.strip():
+            text_blocks.append(block.strip())
 
-        # images
-        if images:
-            parts.append("<h2 style='margin-top:28px;color:#666666;'>Images</h2>")
-            for idx, img in enumerate(images, start=1):
-                path = img.get("path", "")
-                if not path or not Path(path).exists():
-                    continue
-                b64 = self._encode_image(path)
-                if not b64:
-                    continue
-                page = img.get("page", "N/A")
-                parts.append(
-                    "<div class='image-block'>"
-                    f"<img src='data:image/png;base64,{b64}' alt='Image {idx}'>"
-                    f"<div class='image-caption'>Figure {idx} · Page {self._esc(page)}</div>"
-                    "</div>"
-                )
+    # 5) Build HTML
+    parts = []
+    parts.append("<!DOCTYPE html><html><head><meta charset='utf-8'>")
+    parts.append(f"<title>{self._esc(doc_name)} - KAT</title>")
+    parts.append(self._get_css_styles())
+    parts.append("</head><body>")
+    parts.append('<div class="container">')
 
-        parts.append("</div>")  # content
+    # Header
+    parts.append("""
+    <div class="header">
+      <div class="header-logo">
+        <div class="header-logo-text">UBS</div>
+      </div>
+      <h1>Knowledge Analysis Tool (KAT)</h1>
+      <div class="subtitle">Final improved document</div>
+    </div>
+    """)
 
-        # footer
-        parts.append(f"""
-        <div class="footer">
-          <div class="footer-team">UBS · AI Engineering & Automation Excellence Team</div>
-        </div>
-        """)
+    # Content
+    parts.append('<div class="content">')
+    parts.append(f'<div class="doc-title">{self._esc(doc_name)}</div>')
+    parts.append(f'<div class="meta">Mode: {self._esc(workflow_mode)} · Generated: {self._esc(ts)}</div>')
 
-        parts.append("</div></body></html>")
-        html = "".join(parts)
+    # Render content with images in correct positions
+    for block in text_blocks:
+        parts.append(self._classify_block(block))
 
-        if output_path:
-            Path(output_path).write_text(html, encoding="utf-8")
-        return html
+    parts.append("</div>")  # content
+    parts.append("""
+    <div class="footer">
+      <div class="footer-team">UBS · AI Engineering & Automation Excellence Team</div>
+    </div>
+    """)
+    parts.append("</div></body></html>")
+
+    html = "".join(parts)
+
+    if output_path:
+        Path(output_path).write_text(html, encoding="utf-8")
+    return html
