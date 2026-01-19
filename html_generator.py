@@ -294,3 +294,29 @@ class HTMLDocumentGenerator:
     if output_path:
         Path(output_path).write_text(html, encoding="utf-8")
     return html
+
+def generate_html_report(
+    improved_content: str, 
+    images: list, 
+    document_name: str = "Document",
+    workflow_mode: str = "unknown"
+) -> str:
+    """
+    Generate HTML for ONLY final improved content with images.
+    
+    Args:
+        improved_content: Final text from improved_document.improved_content
+        images: List of image metadata from parsed_content.images  
+        document_name: For title
+        workflow_mode: For metadata
+    """
+    generator = HTMLDocumentGenerator()
+    # Pass only what we need, not entire results dict
+    minimal_results = {
+        "improved_document": {"improved_content": improved_content},
+        "parsed_content": {"images": images},
+        "document_name": document_name,
+        "workflow_mode": workflow_mode
+    }
+    return generator.generate_html(minimal_results, None)
+
