@@ -1129,3 +1129,111 @@ class DocumentAutomationWorkflow:
             'generated_script': initial_state['generated_script'],
             'workflow_mode': workflow_mode
         }
+
+
+
+
+async def process_document(self, pdf_path: str, workflow_mode: str = 'full_automation') -> Dict[str, Any]:
+    """Process PDF documents - calls EXISTING generate_html_report()"""
+    
+    initial_state = WorkflowState(
+        pdf_path=pdf_path,
+        parsed_content={},
+        cleaned_content={},
+        automation_analysis={},
+        improved_document={},
+        similarity_matches={},
+        automation_commands={},
+        generated_script={},
+        messages=[],
+        current_step="starting",
+        workflow_mode=workflow_mode
+    )
+
+    if workflow_mode == 'content_improvement':
+        final_state = await self.content_workflow.ainvoke(initial_state)
+    else:
+        final_state = await self.full_workflow.ainvoke(initial_state)
+
+    # ✅ CALL EXISTING HTML FUNCTION
+    improved_content = final_state['improved_document'].get('improved_content', '')
+    images = final_state['parsed_content'].get('image_analysis', [])
+    
+    html_report = generate_html_report(
+        improved_content, 
+        images, 
+        Path(pdf_path).name, 
+        workflow_mode
+    )
+    
+    return {
+        'document_name': Path(pdf_path).name,
+        'parsed_content': final_state['parsed_content'],
+        'cleaned_content': final_state['cleaned_content'],
+        'automation_analysis': final_state['automation_analysis'],
+        'improved_document': final_state['improved_document'],
+        'similarity_matches': final_state.get('similarity_matches', {}),
+        'automation_commands': final_state.get('automation_commands', {}),
+        'generated_script': final_state['generated_script'],
+        'workflow_mode': workflow_mode,
+        'html_report': html_report  # ✅ From existing function
+    }
+
+
+async def process_text_document(self, text_file_path: str, workflow_mode: str = 'full_automation') -> Dict[str, Any]:
+    """Process TEXT files - calls EXISTING generate_html_report()"""
+    
+    with open(text_file_path, 'r', encoding='utf-8') as f:
+        text_content = f.read()
+
+    # ✅ Consistent parsed_content structure
+    parsed_content = {
+        'combined_text': text_content,
+        'page_breakdown': [],
+        'total_pages': 1,
+        'processing_summary': {
+            'total_text_length': len(text_content),
+            'pages_with_images': 0,
+            'total_images': 0,
+            'pages_with_multimodal_content': 0,
+            'image_analysis_count': 0,
+            'input_type': 'text'
+        },
+        'image_analysis': []  # ✅ Empty for text files
+    }
+
+    initial_state = WorkflowState(
+        pdf_path=text_file_path,
+        parsed_content=parsed_content,
+        # ... rest same as before
+    )
+
+    # Run workflow (same as before)
+    initial_state = await self._text_cleaning_agent(initial_state)
+    if workflow_mode == 'content_improvement':
+        initial_state = await self._content_quality_scoring_agent(initial_state)
+        initial_state = await self._content_improvement_agent(initial_state)
+    else:
+        # full automation workflow...
+        pass
+
+    # ✅ CALL EXISTING HTML FUNCTION
+    improved_content = initial_state['improved_document'].get('improved_content', '')
+    images = parsed_content.get('image_analysis', [])  # Empty for text
+    
+    html_report = generate_html_report(
+        improved_content, 
+        images, 
+        Path(text_file_path).name, 
+        workflow_mode
+    )
+    
+    return {
+        'document_name': Path(text_file_path).name,
+        'parsed_content': initial_state['parsed_content'],
+        'cleaned_content': initial_state['cleaned_content'],
+        'automation_analysis': initial_state['automation_analysis'],
+        'improved_document': initial_state['improved_document'],
+        # ... other fields
+        'html_report': html_report  # ✅ From existing function
+    }
