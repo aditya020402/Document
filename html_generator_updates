@@ -47,3 +47,23 @@ parsed_content = {
         for idx, (img_path, page_num) in enumerate(extracted_images)
     ]
 }
+
+
+if 'html_report' in results and results['html_report']:
+    html_content = results['html_report']['content']
+    
+    if st.button("👁️ Preview HTML", key="preview_html", type="primary"):
+        # ✅ OPEN NEW TAB with complete HTML file
+        st.components.v1.html(f"""
+        <script>
+            // Create blob with HTML content
+            const htmlContent = `{html_content}`;
+            const blob = new Blob([htmlContent], {{type: 'text/html'}});
+            const url = URL.createObjectURL(blob);
+            
+            // Open in NEW TAB (not Streamlit iframe)
+            window.open(url, '_blank', 'noopener,noreferrer');
+        </script>
+        """, height=0)
+        
+        st.success("✅ HTML opened in new tab!")
