@@ -262,11 +262,12 @@ class DocumentDatabase:
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT DISTINCT b.* 
-                FROM batches b
-                WHERE b.user_email = ?
-                ORDER BY b.created_at DESC
-                LIMIT ?
+            SELECT b.* FROM batches b
+            JOIN documents d ON b.batch_id = d.batch_id
+            WHERE b.user_email = ? 
+            GROUP BY b.batch_id
+            ORDER BY b.created_at DESC
+            LIMIT ?
             """, (user_email, limit))
             rows = cursor.fetchall()
             conn.close()
