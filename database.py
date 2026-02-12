@@ -254,3 +254,20 @@ class DocumentDatabase:
             
             conn.close()
             return stats
+
+
+    def get_user_batches(self, user_email: str, limit: int = 10) -> List[Dict]:
+        """Get recent batches for specific user"""
+        with db_lock:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT DISTINCT b.* 
+                FROM batches b
+                WHERE b.user_email = ?
+                ORDER BY b.created_at DESC
+                LIMIT ?
+            """, (user_email, limit))
+            rows = cursor.fetchall()
+            conn.close()
+            return [dict(row) for row in rows]
