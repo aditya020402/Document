@@ -24,20 +24,7 @@ def validate_and_format_email(email: str) -> str:
 
 def get_user_batches(user_email: str, limit: int = 10) -> list:
     """Get recent batches for user"""
-    with db_lock:  # Assuming db has thread lock
-        conn = db._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT b.* FROM batches b
-            JOIN documents d ON b.batch_id = d.batch_id
-            WHERE b.user_email = ? AND b.status IN ('pending', 'processing', 'completed')
-            GROUP BY b.batch_id
-            ORDER BY b.created_at DESC
-            LIMIT ?
-        """, (user_email, limit))
-        rows = cursor.fetchall()
-        conn.close()
-        return [dict(row) for row in rows]
+    return db.get_user_batches(user_email, limit)
 
 def main():
     st.set_page_config(page_title="KAT Bulk Upload", page_icon="📤", layout="wide")
@@ -51,7 +38,7 @@ def main():
         
         email_input = st.text_input(
             "🔍 UBS Email",
-            placeholder="john.doe or john.doe@ubs.com",
+            placeholder="aditya.sharma or aditya.sharma@ubs.com",
             help="Search your batches or upload new ones"
         )
         
